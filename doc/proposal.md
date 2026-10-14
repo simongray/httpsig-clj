@@ -13,8 +13,8 @@ sends. Nothing in Clojure implements RFC 9421 yet. No library in any
 language does all of this in one codebase for the JVM, Node and browsers.
 
 It would follow whatwg-url as a spec library and websub-clj as a protocol
-library: one `.cljc` codebase with the platform's own crypto, the spec
-section beside each rule, messages as plain maps, errors as data, safe
+library: one `.cljc` codebase with its cryptography from webcrypto-clj, the
+spec section beside each rule, messages as plain maps, errors as data, safe
 defaults and nothing in the background. The code below sketches the API, so
 none of it has run.
 
@@ -65,15 +65,16 @@ Namespaces
 | `httpsig.sfv` | RFC 9651 |
 | `httpsig.cavage` | draft-cavage |
 | `httpsig.ring` | verification of Ring requests, and middleware |
-| `httpsig.impl.*` | `^:no-doc`: components, the signature base, DER, and the crypto of each platform |
+| `httpsig.impl.*` | `^:no-doc`: components, the signature base, and RFC 9421's algorithms in webcrypto-clj's terms |
 
-The library would depend on whatwg-url and wary-fetch. RFC 9421 builds
-`@query-param` on the form-urlencoded parsing of the URL Standard, so the
-`params` and `percent` namespaces of whatwg-url give exactly what the RFC
-asks for. From wary-fetch it would take the synchronous hashes and HMACs of
-both platforms, the `async` helpers that let one codebase take futures and
-promises, and the hidden texts for secrets and Authorization headers. That
-adds nothing new, since wary-fetch depends only on whatwg-url.
+The library would depend on whatwg-url, webcrypto-clj and wary-fetch. RFC
+9421 builds `@query-param` on the form-urlencoded parsing of the URL
+Standard, so the `params` and `percent` namespaces of whatwg-url give
+exactly what the RFC asks for. From webcrypto-clj it would take keys,
+signatures and PEM, the synchronous hashes, and comparisons in constant
+time. From wary-fetch it would take only the hidden texts and `async/then`,
+which unlike webcrypto-clj's `then` also waits for a future on the JVM.
+That adds nothing new, since wary-fetch already depends on the other two.
 
 The dependency on wary-fetch gets a TODO in `deps.edn` to reconsider it
 later. It keeps wary-fetch from ever parsing structured fields through
@@ -105,7 +106,9 @@ namespace turns it into a message first.
 
 Signing returns the message with its `:url` normalized by wary-fetch's
 `url/legal-url`, which is the form that the client of each platform sends.
-So `@target-uri` matches the URL on the wire.
+So `@target-uri` matches the URL on the wire. A request's `:query-params`
+only join its URL as wary-fetch prepares it, so the sender signs the
+prepared request (see [Senders](#senders)).
 
 
 Keys
@@ -114,31 +117,30 @@ Keys
 A key is a map of its `:keyid`, its `:alg` (a name from RFC 9421's
 registry) and its material, which is one of these:
 
-- `:pem`, the text of a PEM key: SPKI or PKCS#8, or the older PKCS#1 and
-  SEC1
+- `:pem`, the text of a PEM key, which webcrypto-clj's `pem/key-data`
+  reads: SPKI or PKCS#8, or the older PKCS#1 and SEC1
 - `:jwk`, a JWK as a map
 - `:secret`, the bytes or the text of a shared secret for hmac-sha256
-- `:key`, a key object of the platform, e.g. a CryptoKey that a page keeps
+- `:key`, a key of webcrypto-clj, e.g. a CryptoKey that a page keeps
   unextractable in IndexedDB
 
 The material can be a hidden text, as `generate-key` returns it. Without an
 `:alg`, the key type decides: an RSA key is rsa-v1_5-sha256, as in
-Mastodon, and an Ed25519 key is ed25519. A key map can also carry keys of
-your own, e.g. the `:actor` it belongs to. Verification returns the key it
-used, with those keys.
-
-Neither platform imports PKCS#1 or SEC1, and the JDK imports no JWK. So
-`impl.der` converts every key to SPKI or PKCS#8 in cljc, once for both
-platforms. It also rewrites the RSASSA-PSS identifier of RFC 9421's own PSS
-test key to rsaEncryption, since WebCrypto refuses the key otherwise.
+Mastodon, and an Ed25519 key is ed25519. That needs one addition to
+webcrypto-clj, since `import-key` needs the algorithm before it reads the
+key. Its `pem/key-data` should also return the kind of key it holds (RSA,
+EC with its curve, or Ed25519), which it reads from the DER anyway. A key
+map can also carry keys of your own, e.g. the `:actor` it belongs to.
+Verification returns the key it used, with those keys.
 
 The library imports the material each time it signs or verifies. That keeps
 a key as plain data. A verifier gets most of its keys fresh from the network
 anyway. A cache of imported keys can come later, if a benchmark shows that
 importing costs much next to an RSA signature.
 
-To make a key, e.g. for an actor, use `generate-key` (which returns a
-promise in ClojureScript):
+To make a key, e.g. for an actor, use `generate-key`, which calls the
+`generate-key`, `export-key` and `pem/encode` of webcrypto-clj (and returns
+a promise in ClojureScript):
 
 ```clojure
 (httpsig/generate-key "rsa-v1_5-sha256"
@@ -239,8 +241,11 @@ exception. The result is then a map with an `:error` keyword, plus the
 `:label` and `:keyid` of the signature when it has them. The docstring of
 `verify` lists the keywords, e.g. `::unsigned`, `::malformed`,
 `::not-covered` (for a component that the policy requires),
-`::unknown-key`, `::wrong-algorithm`, `::unsupported-algorithm`,
-`::expired`, `::digest-mismatch` and `::invalid-signature`.
+`::unknown-key`, `::invalid-key`, `::wrong-algorithm`,
+`::unsupported-algorithm`, `::expired`, `::digest-mismatch` and
+`::invalid-signature`. Where webcrypto-clj refuses, its errors become
+these: its not-supported-error becomes `::unsupported-algorithm`, and the
+data-error of a key that won't import becomes `::invalid-key`.
 
 A mistake in a call throws an ex-info with a `:type`, as websub-clj's
 requests do: a key without material, a covered component that the message
@@ -252,16 +257,14 @@ Sync or async
 -------------
 
 On the JVM, `sign` and `verify` return values. In ClojureScript they return
-promises, as wary-fetch's `send!` does. Code for both platforms chains them
-with `async/then`. The reason is WebCrypto, which has only promises. The W3C
-has no plan for anything else. Node's crypto module is synchronous, but
-using it would make Node behave unlike the browser. So the ClojureScript
-code uses WebCrypto in Node and in browsers alike.
+promises, as the `sign` and `verify` of webcrypto-clj do, since WebCrypto
+has only promises. Code for both platforms chains them with `async/then`.
+This is the split that webcrypto-clj makes, for the same reasons.
 
 Everything that needs no key is synchronous everywhere: the components, the
-signature base, the structured fields and the digests. Their hashes come
-from wary-fetch, which uses the Closure Library in ClojureScript. HMAC is
-synchronous too, but `sign` returns a promise for every algorithm in
+signature base, the structured fields and the digests. The digests take
+their hashes from webcrypto-clj's `hash` namespace. HMAC is synchronous
+there too, but `sign` returns a promise for every algorithm in
 ClojureScript so that callers needn't know which.
 
 
@@ -284,13 +287,15 @@ relays.
 
 A signature covers the URL, so every hop of a redirect needs its own
 signature. Mastodon signs each hop too. Since wary-fetch's `send!` follows
-redirects itself, it needs one change: a `:prepare-fn` in the request. The
-client calls it on the request of each hop, the first one included, and
-sends the request it returns (or in ClojureScript the request that its
-promise resolves to). The sender sets it to sign, so the rules of redirects
-stay in wary-fetch. In a browser,
-fetch follows redirects itself, so only the first hop gets a signature
-there.
+redirects itself, it needs one change: a `:prepare-fn` in the request. Each
+client of wary-fetch that follows redirects calls it on the prepared request
+of each hop, the first one included. It sends the request that the function
+returns (or in ClojureScript the request that its promise resolves to). The
+prepared request already has its `:query-params` in its URL and its hidden
+texts revealed, which a signature made before `send!` would miss. The
+sender sets the function to sign, so the rules of redirects stay in
+wary-fetch. In a browser, fetch follows redirects itself, so only the first
+hop gets a signature there.
 
 
 Ring
@@ -390,9 +395,11 @@ depends on. Like whatwg-url's `params`, `serialize` also takes maps.
 ```
 
 Like the RFC, `parse` takes the type of the field. It returns nil for a
-field that doesn't parse, since the RFC says to ignore such a field. The
-parser accepts extra base64 padding, since RFC 9530's own examples have it
-and the test suite allows it.
+field that doesn't parse, since the RFC says to ignore such a field. RFC
+9651 asks a parser to accept base64 without its padding or with pad bits
+that aren't zero, and RFC 9530's own examples over-pad. So the parser
+normalizes the text before it calls webcrypto-clj's strict
+`bytes/from-base64`.
 
 
 draft-cavage
@@ -438,52 +445,57 @@ Misskey and Sharkey, which answer a bad signature with a stripped-down
 actor and a 200. It fails against Pixelfed too, which drops the delivery.
 
 
-Crypto on each platform
------------------------
+Algorithms
+----------
 
-| Algorithm | JVM | WebCrypto, in Node and browsers |
+Each algorithm of RFC 9421 is a pair of algorithms of webcrypto-clj, one to
+import the key and one to sign and verify. This table is all of the
+library's cryptography:
+
+| RFC 9421 | `import-key` | `sign` and `verify` |
 |---|---|---|
-| rsa-pss-sha512 | RSASSA-PSS with SHA-512, MGF1 and a 64-byte salt | RSA-PSS, salt of 64 |
-| rsa-v1_5-sha256 | SHA256withRSA | RSASSA-PKCS1-v1_5 |
-| hmac-sha256 | wary-fetch's `bytes/hmac` (javax.crypto) | wary-fetch's `bytes/hmac` (Closure Library) |
-| ecdsa-p256-sha256 | SHA256withECDSAinP1363Format | ECDSA on P-256 |
-| ecdsa-p384-sha384 | SHA384withECDSAinP1363Format | ECDSA on P-384 |
-| ed25519 | Ed25519 | Ed25519 (Chrome 137, Firefox 129, Safari 17, Node 22.13) |
+| rsa-pss-sha512 | `{:name :rsa-pss :hash :sha-512}` | `{:name :rsa-pss :salt-length 64}` |
+| rsa-v1_5-sha256 | `{:name :rsassa-pkcs1-v1_5 :hash :sha-256}` | `:rsassa-pkcs1-v1_5` |
+| hmac-sha256 | `{:name :hmac :hash :sha-256}` | `:hmac` |
+| ecdsa-p256-sha256 | `{:name :ecdsa :named-curve :p-256}` | `{:name :ecdsa :hash :sha-256}` |
+| ecdsa-p384-sha384 | `{:name :ecdsa :named-curve :p-384}` | `{:name :ecdsa :hash :sha-384}` |
+| ed25519 | `:ed25519` | `:ed25519` |
+
+The rsa-sha256 of draft-cavage is rsa-v1_5-sha256.
 
 - **ECDSA needs no conversion.** RFC 9421 takes the signature as r and s
-  side by side. The JDK's P1363 variants produce that directly, and
-  WebCrypto produces nothing else.
-- **Ed25519 sets the floor at Java 17.** The JDK has had Ed25519 since
-  Java 15, and 17 is the first long-term release after 11. On Java 11,
-  Ed25519 would be the one algorithm that works on some JVMs and not on
-  others. BouncyCastle would add 8 MB to fill that gap, and a pure Clojure
-  Ed25519 can't sign in constant time.
-- **HMACs are compared in constant time,** with wary-fetch's `bytes/same?`.
-- **A page served over plain http has no WebCrypto,** and signing there
-  throws with a message that says why.
+  side by side, which is how webcrypto-clj returns it on every platform.
+- **Ed25519 needs Java 15.** Below that, webcrypto-clj throws
+  not-supported-error, which a verification reports as
+  `::unsupported-algorithm`.
+- **A stranger's key gets webcrypto-clj's checks** on every platform, e.g.
+  for weak Ed25519 keys, ECDSA values out of range and RSA keys whose
+  numbers don't agree.
+- **A page served over plain http has no WebCrypto,** and webcrypto-clj's
+  error says why.
 
 
 Platforms
 ---------
 
-- Clojure 1.11 and Java 17 or later, for Ed25519. The other libraries take
-  Java 11, but Clojure 1.13 will require 17. The blog already needs it for
-  Jetty 12.
-- Node 22.13 or later, the first release of Node 22 in which Ed25519 is no
-  longer experimental. Node 20 has reached its end of life.
+- Clojure 1.11 and Java 11 or later (15 or later for Ed25519), like
+  webcrypto-clj. The libraries move to Java 17 together, once Clojure
+  requires it.
+- Node 22 or later, as webcrypto-clj needs.
 - Any browser with WebCrypto, and for Ed25519 at least Chrome 137, Firefox
   129 or Safari 17.
-- The CI of whatwg-url: Java 25 and Node 24, a job on Java 17, and the Node
-  tests again with advanced compilation. A browser test build, like
-  websub-clj's, runs by hand.
+- The CI of wary-fetch: Java 25 and Node 24, a job on Java 11, the Node
+  tests again with advanced compilation, and the ClojureScript tests in a
+  headless Chrome.
 
 
 Tests
 -----
 
-- **RFC 9421.** The tests load the keys of Appendix B.1 in both their PEM
-  and JWK forms, which also tests the conversions. They compare every
-  example's signature base with the RFC's text. The HMAC (B.2.5), Ed25519
+- **RFC 9421.** Since webcrypto-clj already tests the keys of Appendix B.1
+  and the signatures that they make, the tests here compare every example's
+  signature base with the RFC's text and sign and verify whole messages.
+  The HMAC (B.2.5), Ed25519
   (B.2.6 and B.4) and rsa-v1_5 (`proxy_sig` of section 4.3) signatures are
   deterministic, so the tests compare them byte for byte. They only verify
   the RSA-PSS and ECDSA ones. The six messages of B.4 check what must and
@@ -571,10 +583,11 @@ function.
 Size
 ----
 
-Expect about 2,000 lines of source and as many again of tests. RFC 9421
+Expect about 1,700 lines of source and as many again of tests. RFC 9421
 with its components, signature base and keys is the largest part at about
-800 lines. Structured fields, the crypto of each platform with the DER
-conversions, and draft-cavage take about 300 each. Digests and Ring take
-about 100 each. The `:prepare-fn` of wary-fetch is a small change to its
-JVM and Node clients. On podcast-clj's scale that's a 4, a week or two.
-Most of it goes into the components, the key conversions and the vectors.
+800 lines. Structured fields and draft-cavage take about 300 each, and the
+digests, Ring and the table of algorithms about 100 each. The `:prepare-fn`
+of wary-fetch is a small change to its clients, and the kind of key in
+`pem/key-data` a smaller one to webcrypto-clj. On podcast-clj's scale
+that's a 3, a few days, now that webcrypto-clj has the cryptography. Most of
+it goes into the components and the vectors.
