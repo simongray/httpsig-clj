@@ -148,9 +148,11 @@
       (throw (missing id "The request has no URL"))))
 
 (defn method-name
-  "The method of the request `message` as HTTP writes it, e.g. POST."
+  "The method of the request `message` as HTTP writes it, e.g. POST. A
+  request without one, or with a nil one as wary-fetch prepares it, is a
+  GET."
   [message]
-  (let [method (:method message :get)]
+  (let [method (or (:method message) :get)]
     (if (keyword? method) (str/upper-case (name method)) (str method))))
 
 ;; RFC 9421, section 2.2.8: "percent-encode after encoding" of the

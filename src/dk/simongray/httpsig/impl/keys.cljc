@@ -65,12 +65,23 @@
     (throw (unsupported alg (str "The algorithms of RFC 9421 are " (pr-str (sort (keys algorithms)))
                                  ", not " (pr-str alg))))))
 
-;; TODO: take the kind of a PEM key from webcrypto-clj's pem/key-data once
-;; it says, rather than try to import the key for each algorithm in turn
+;; TODO: drop these once the deps take a webcrypto-clj whose pem/key-data
+;; says the kind of key, which 0.1.1 doesn't
 (def inferred-algorithms
-  "The algorithms that a key in PEM without an :alg can be for, tried in
-  turn. An RSA key is rsa-v1_5-sha256, as Mastodon takes it."
+  "The algorithms that a key in PEM without an :alg or a kind can be for,
+  tried in turn. An RSA key is rsa-v1_5-sha256, as Mastodon takes it."
   ["rsa-v1_5-sha256" "ecdsa-p256-sha256" "ecdsa-p384-sha384" "ed25519"])
+
+(defn kind-algorithm
+  "The algorithm of a key of the :kind and :named-curve that webcrypto-clj's
+  pem/key-data gives it, or nil. An RSA key is rsa-v1_5-sha256, as
+  Mastodon takes it."
+  [{:keys [kind named-curve]}]
+  (case kind
+    :rsa     "rsa-v1_5-sha256"
+    :ec      (case named-curve :p-256 "ecdsa-p256-sha256" :p-384 "ecdsa-p384-sha384" nil)
+    :ed25519 "ed25519"
+    nil))
 
 (defn jwk-algorithm
   "The algorithm of the JWK `jwk` by its key type, or nil."
@@ -159,15 +170,18 @@
                          :else      (throw error))))))
 
 (defn candidates
-  "The algorithms that the key map `key` can be for: its :alg, or else those
-  of its material."
-  [{:keys [alg jwk secret]}]
+  "The algorithms that the key map `key` can be for: its :alg, or else that
+  of its `material`, the :format and :data of import-key, with the :kind
+  of a PEM key."
+  [{:keys [alg jwk secret]} material]
   (cond
-    alg    [(check-algorithm alg)]
-    secret ["hmac-sha256"]
-    jwk    [(or (jwk-algorithm (jwk-of jwk))
-                (throw (invalid-key "The JWK is of no algorithm of RFC 9421")))]
-    :else  inferred-algorithms))
+    alg              [(check-algorithm alg)]
+    secret           ["hmac-sha256"]
+    jwk              [(or (jwk-algorithm (jwk-of jwk))
+                          (throw (invalid-key "The JWK is of no algorithm of RFC 9421")))]
+    (:kind material) [(or (kind-algorithm material)
+                          (throw (invalid-key "The PEM key is of no algorithm of RFC 9421")))]
+    :else            inferred-algorithms))
 
 (defn material
   "The material of the key map `key` as the :format and :data that
@@ -195,7 +209,8 @@
   (async/promised
    #(if (:key key)
       (given-key key)
-      (first-imported (material key false) (candidates key) [:sign] false))))
+      (let [m (material key false)]
+        (first-imported m (candidates key m) [:sign] false)))))
 
 (defn public-of
   "The public key of the private key `imported`, as a map of its :alg and
@@ -213,9 +228,9 @@
      (let [{:keys [format] :as m} (when-not (:key key) (material key true))]
        (cond
          (:key key)        (given-key key)
-         (= :pkcs8 format) (wary-async/then (first-imported m (candidates key) [:sign] true)
+         (= :pkcs8 format) (wary-async/then (first-imported m (candidates key m) [:sign] true)
                                             public-of)
-         :else             (first-imported m (candidates key) [:verify] false))))))
+         :else             (first-imported m (candidates key m) [:verify] false))))))
 
 (defn modulus-bits
   "The bits of the modulus of the RSA key `k` of webcrypto-clj, or nil for
