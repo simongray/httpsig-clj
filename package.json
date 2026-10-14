@@ -4,6 +4,7 @@
   "private": true,
   "description": "Node test tools for httpsig-clj. The library itself has no npm dependencies.",
   "devDependencies": {
+    "http-message-signatures": "1.0.6",
     "shadow-cljs": "^3.5.3"
   }
 }

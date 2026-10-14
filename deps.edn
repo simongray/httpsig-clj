@@ -15,11 +15,14 @@
          dk.simongray/wary-fetch    {:mvn/version "0.14.0"}}
 
  :aliases
- {;; clojure -X:test  (data.json reads the tests of structured fields, and
-  ;; test.check makes the random messages of the generative tests)
+ {;; clojure -X:test  (data.json reads the tests of structured fields,
+  ;; test.check makes the random messages of the generative tests, and
+  ;; Visma's library of RFC 9421 verifies what this one signs, and the other
+  ;; way round)
   :test {:extra-paths ["test"]
-         :extra-deps  {org.clojure/data.json  {:mvn/version "2.5.2"}
-                       org.clojure/test.check {:mvn/version "1.1.3"}
+         :extra-deps  {org.clojure/data.json             {:mvn/version "2.5.2"}
+                       org.clojure/test.check            {:mvn/version "1.1.3"}
+                       net.visma.autopay/http-signatures {:mvn/version "1.3.1"}
                        io.github.cognitect-labs/test-runner
                        {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
          :main-opts   ["-m" "cognitect.test-runner"]

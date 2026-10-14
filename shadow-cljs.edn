@@ -5,10 +5,11 @@
                          :ns-regexp "-test$"
                          :autorun   true}
           ;; clojure -M:cljs compile browser-test, then
-          ;; node test/browser-run.mjs target/browser-test
+          ;; node test/browser-run.mjs target/browser-test (the tests of
+          ;; Node alone, against a library of node:crypto, stay out)
           :browser-test {:target     :browser-test
                          :test-dir   "target/browser-test"
-                         :ns-regexp  "-test$"
+                         :ns-regexp  "(?<!\\.node)-test$"
                          :runner-ns  dk.simongray.httpsig.browser-runner
                          ;; the test data comes over HTTP in a browser
                          :js-options {:resolve {"fs" false}}}}}
