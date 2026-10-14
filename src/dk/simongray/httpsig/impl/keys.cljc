@@ -226,11 +226,21 @@
   [alg keyid]
   (let [{:keys [generate]} (get algorithms (check-algorithm alg))]
     (wary-async/then
-     (webcrypto/generate-key generate true [:sign :verify])
-     (fn [generated]
-       (if (= "hmac-sha256" alg)
+     (async/attempt #(webcrypto/generate-key generate true [:sign :verify]))
+     (fn [{generated :value e :error}]
+       (cond
+         ;; e.g. Ed25519 below Java 15
+         (= :dk.simongray.webcrypto/not-supported-error (async/error-type e))
+         (throw (unsupported alg (str "The platform lacks " alg ": " (ex-message e))))
+
+         e
+         (throw e)
+
+         (= "hmac-sha256" alg)
          (wary-async/then (webcrypto/export-key :raw generated)
                           #(hash-map :keyid keyid :alg alg :secret (secret/hide %)))
+
+         :else
          (wary-async/then
           (wary-async/all [(webcrypto/export-key :pkcs8 (:private-key generated))
                            (webcrypto/export-key :spki (:public-key generated))])
