@@ -181,6 +181,30 @@
                          (support/then (error-of (with-signature signed (str field ",created=10000000000000000000000000")))
                                        #(is (nil? %) "a created out of range, which it doesn't sign"))])))))))
 
+;; A signature that can't verify fails before the key function, which may
+;; fetch an actor
+(deftest errors-before-the-key
+  (let [calls (atom 0)
+        key-fn (fn [_] (swap! calls inc) actor-key)]
+    (support/run
+     (fn []
+       (support/then (cavage/sign inbox-post actor-key {:signed-headers ["(request-target)" "host" "date" "digest" "content-type"]})
+                     (fn [signed]
+                       (support/all
+                        [(support/then (cavage/verify (update signed :headers dissoc "Content-Type") key-fn)
+                                       (fn [result]
+                                         (is (= {:error ::httpsig/missing-component :component "content-type"}
+                                                (select-keys result [:error :component])))))
+                         (support/then (cavage/verify (update signed :headers dissoc "Date") key-fn)
+                                       (fn [result]
+                                         (is (= {:error ::httpsig/missing-component :component "date"}
+                                                (select-keys result [:error :component])))))
+                         (support/then (cavage/verify (update signed :headers dissoc "Digest") key-fn)
+                                       (fn [result]
+                                         (is (= {:error ::httpsig/missing-component :component "digest"}
+                                                (select-keys result [:error :component])))))]))))
+     #(is (zero? @calls)))))
+
 ;; Mastodon's policy, with host for every method but POST and a digest of
 ;; any body
 (deftest policy

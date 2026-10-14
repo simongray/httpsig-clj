@@ -4,11 +4,12 @@
 
   Each step of parsing is a function of the text `s` and the index `i` that
   it starts at, and returns a pair of its value and the index after it. A
-  step throws ::invalid when the text isn't what it reads. Each step of
-  serializing returns text, and throws ::invalid for a value that it can't
-  serialize."
+  step throws ::sfv/invalid when the text isn't what it reads. Each step
+  of serializing returns text, and throws ::sfv/invalid for a value that
+  it can't serialize."
   (:refer-clojure :exclude [parse-boolean])
   (:require [clojure.string :as str]
+            [dk.simongray.httpsig.sfv :as-alias sfv]
             [dk.simongray.webcrypto.bytes :as bytes])
   #?(:clj (:import [java.math BigDecimal]
                    [java.nio ByteBuffer]
@@ -25,7 +26,7 @@
   "The exception of text or data that isn't a structured field, for the
   reason `why`."
   [why]
-  (ex-info why {:type ::invalid}))
+  (ex-info why {:type ::sfv/invalid}))
 
 (defn code-at
   "The code of the character at `i` in the text `s`, or -1 past its end."
@@ -463,7 +464,7 @@
       (when (= (skip s i sp) (count s))
         v))
     (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e
-      (when-not (= ::invalid (:type (ex-data e)))
+      (when-not (= ::sfv/invalid (:type (ex-data e)))
         (throw e)))))
 
 ;; RFC 9651, section 4.1.4

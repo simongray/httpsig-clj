@@ -28,8 +28,7 @@
             [dk.simongray.whatwg-url :as url]))
 
 (def default-options
-  "The default of each option of sign and verify that has one, beside those
-  of httpsig/default-options:
+  "The default of each option of sign and signing-string that has one:
 
   - :algorithm, \"rsa-sha256\": the name that a signature by an RSA key
     gives its algorithm, as Mastodon, Misskey and WordPress send it, where
@@ -292,50 +291,70 @@
         (and (message/has-body? message) (not (covers? "digest"))) "digest"))))
 
 (defn- freshness-error
-  "The :error of a signature over the `headers` of the `message`, with its
-  :created and :expires, by the clock and the `opts`, or nil when it's
-  fresh. Its time is its (created) when it covers one, and else its Date."
+  "The error of a signature over the `headers` of the `message`, with its
+  :created and :expires, by the clock and the `opts`, as a map, or nil
+  when it's fresh. Its time is its (created) when it covers one, and else
+  its Date."
   [message {:keys [headers created expires]} {:keys [max-age-seconds max-skew-seconds] :as opts}]
-  (let [t    (seconds (now opts))
-        time (if (some #{"(created)"} headers)
-               created
-               (some-> (message/field-lines (:headers message) "date") first date/parse seconds))]
+  (let [t        (seconds (now opts))
+        created? (some #{"(created)"} headers)
+        date     (when-not created? (first (message/field-lines (:headers message) "date")))
+        time     (if created? created (some-> date date/parse seconds))]
     (cond
-      (nil? time)                      ::httpsig/malformed
-      (> (- t time) max-age-seconds)   ::httpsig/expired
-      (> (- time t) max-skew-seconds)  ::httpsig/not-yet-valid
+      (and (not created?) (nil? date)) {:error ::httpsig/missing-component :component "date"}
+      (nil? time)                      {:error ::httpsig/malformed}
+      (> (- t time) max-age-seconds)   {:error ::httpsig/expired}
+      (> (- time t) max-skew-seconds)  {:error ::httpsig/not-yet-valid}
       (and (some #{"(expires)"} headers) expires (> (- t max-skew-seconds) expires))
-      ::httpsig/expired)))
+      {:error ::httpsig/expired})))
 
 ;; RFC 3230, section 4.3.2: digests by algorithm, the names in any case
 (defn- digest-error
-  "The :error of the Digest of the `message` when a signature covers it, or
-  nil when it has a SHA-256 or SHA-512 that matches its body and none that
-  doesn't."
+  "The error of the Digest of the `message` when a signature covers it, as
+  a map, or nil when it has a SHA-256 or SHA-512 that matches its body and
+  none that doesn't."
   [message]
   (let [b       (message/body-bytes (:body message))
-        digests (for [line  (message/field-lines (:headers message) "digest")
+        lines   (message/field-lines (:headers message) "digest")
+        digests (for [line  lines
                       entry (str/split line #",")
                       :let  [[_ alg value] (re-matches #"\s*([A-Za-z0-9-]+)=(\S+)\s*" entry)
                              hash-alg (get {"sha-256" :sha-256 "sha-512" :sha-512}
                                            (some-> alg str/lower-case))]
                       :when hash-alg]
                   (some-> (bytes/from-base64 value) (bytes/same? (hash/digest hash-alg b))))]
-    (when (or (empty? digests) (some not digests))
-      ::httpsig/digest-mismatch)))
+    (cond
+      (nil? lines)                             {:error ::httpsig/missing-component :component "digest"}
+      (or (empty? digests) (some not digests)) {:error ::httpsig/digest-mismatch})))
 
 (defn- policy-error
   "The first error of the `signature` of the `message` that the library
-  finds before it looks for a key, as a keyword, or nil."
+  finds before it looks for a key, as a map of the :error and maybe the
+  :component, or nil."
   [message {:keys [algorithm headers] :as signature} opts]
-  (or (:error signature)
+  (or (some->> (:error signature) (hash-map :error))
       (when-not (contains? #{nil "rsa-sha256" "hs2019"} algorithm)
-        ::httpsig/wrong-algorithm)
-      (when (uncovered message headers opts)
-        ::httpsig/not-covered)
+        {:error ::httpsig/wrong-algorithm})
+      (some->> (uncovered message headers opts)
+               (hash-map :error ::httpsig/not-covered :component))
       (freshness-error message signature opts)
       (when (some #{"digest"} headers)
         (digest-error message))))
+
+(defn- signing-strings
+  "The texts that the `signature` of the `message` can sign by the `opts`,
+  or a map of the :error and the :component that keeps it from them. One
+  has the query of the URL, and for a GET or a HEAD another hasn't, since
+  Mobilizon and Pleroma sign the path alone. A method that changes
+  something has its query signed."
+  [message {:keys [headers created expires]} opts]
+  (try
+    (let [reads? (contains? #{"GET" "HEAD"} (str/upper-case (components/method-name message)))]
+      (into [] (distinct) (for [query? (if reads? [true false] [true])]
+                            (signing-string message headers {:created created :expires expires}
+                                            (assoc opts :query? query?)))))
+    (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e
+      {:error (async/error-type e) :component (:component (ex-data e))})))
 
 (defn- key-error
   "The :error of the key `verifier` (a map of its :alg and :key) for the
@@ -349,30 +368,20 @@
       (and bits (< bits min-rsa-bits))                              ::httpsig/invalid-key)))
 
 (defn- verifies?
-  "Whether the `signature` of the `message` verifies with the key
-  `verifier` over the signing string (in ClojureScript a promise of it).
-  For a GET or a HEAD, that can be without the query of the URL, since
-  Mobilizon and Pleroma sign the path alone. A method that changes
-  something has its query signed."
-  [message {:keys [headers created expires signature]} {:keys [alg key]} opts]
-  (let [params  {:created created :expires expires}
-        reads?  (contains? #{"GET" "HEAD"} (str/upper-case (components/method-name message)))
-        attempt (fn [query?]
-                  (wary-async/then
-                   (async/attempt #(webcrypto/verify (:sign (get keys/algorithms alg)) key signature
-                                                     (bytes/encode (signing-string message headers params
-                                                                                   (assoc opts :query? query?)))))
-                   #(true? (:value %))))]
-    (wary-async/then (attempt true)
-                     (fn [verified]
-                       (if (or verified (not reads?) (not (some #{"(request-target)"} headers)))
-                         verified
-                         (attempt false))))))
+  "Whether the `signature` verifies with the key `verifier` over one of the
+  signing `strings` (in ClojureScript a promise of it)."
+  [{:keys [signature]} strings {:keys [alg key]}]
+  (wary-async/some (fn [s]
+                     (wary-async/then
+                      (async/attempt #(webcrypto/verify (:sign (get keys/algorithms alg)) key signature
+                                                        (bytes/encode s)))
+                      #(true? (:value %))))
+                   strings))
 
 (defn- verified
-  "The result of verifying the `signature` of the `message` with the key
-  map `key`."
-  [message signature key opts]
+  "The result of verifying the `signature` over one of the signing
+  `strings` with the key map `key`."
+  [signature strings key opts]
   (let [failure #(hash-map :keyid (:keyid signature) :error %)]
     (if (nil? key)
       (failure ::httpsig/unknown-key)
@@ -389,7 +398,7 @@
            (failure (key-error verifier signature opts))
 
            :else
-           (wary-async/then (verifies? message signature verifier opts)
+           (wary-async/then (verifies? signature strings verifier)
                             #(if %
                                (cond-> {:keyid      (:keyid signature)
                                         :alg        (:alg verifier)
@@ -421,8 +430,7 @@
     Node wrote it
   - a Digest whose SHA-256 or SHA-512 matches the body, when it's signed
 
-  The `opts` are those of httpsig/default-options and default-options, and
-  these:
+  The `opts` are those of httpsig/default-options, and these:
 
   - :required-headers, the headers that a signature has to cover, in place
     of the default: date or (created), (request-target) or digest, host
@@ -436,15 +444,17 @@
   ([message key-fn opts]
    (async/promised
     (fn []
-      (let [opts  (merge httpsig/default-options default-options opts)
+      (let [opts  (merge httpsig/default-options opts)
             lines (message/field-lines (:headers message) "signature")]
         (if (nil? lines)
           {:error ::httpsig/unsigned}
-          (let [signature (read-signature (first lines))]
-            (if-let [error (policy-error message signature opts)]
-              {:keyid (:keyid signature) :error error}
+          (let [signature (read-signature (first lines))
+                error     (policy-error message signature opts)
+                strings   (when-not error (signing-strings message signature opts))]
+            (if-let [error (or error (when (map? strings) strings))]
+              (merge {:keyid (:keyid signature)} error)
               (wary-async/then (key-fn (select-keys signature [:keyid :algorithm]))
-                               #(verified message signature % opts))))))))))
+                               #(verified signature strings % opts))))))))))
 
 (comment
   (def k

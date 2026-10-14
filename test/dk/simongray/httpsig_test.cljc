@@ -275,6 +275,24 @@
      #(check ["@method" "@authority" "@request-target"] nil)
      #(check ["@method" "@target-uri"] nil))))
 
+(deftest error-components
+  (let [k        (get examples/jwk-keys "test-shared-secret")
+        delivery {:method :post :url "https://example.com/inbox" :headers {"Content-Type" "text/plain"} :body "hi"}
+        error    (fn [message]
+                   (support/then (httpsig/verify message (constantly k)) #(select-keys % [:error :component])))]
+    (support/run
+     (fn []
+       (support/then (httpsig/sign delivery k {:components ["@method" "@target-uri" ["content-type" {:bs true}] "content-digest"]})
+                     (fn [signed]
+                       (support/all
+                        [(support/then (error (update signed :headers dissoc "Content-Type"))
+                                       #(is (= {:error ::httpsig/missing-component :component ["content-type" {"bs" true}]} %)
+                                            "the component as signatures gives it"))
+                         (support/then (error (update signed :headers dissoc "Content-Digest"))
+                                       #(is (= {:error ::httpsig/missing-component :component "content-digest"} %)))]))))
+     #(support/then (support/outcome (fn [] (httpsig/sign delivery k {:nonce "a\nb"})))
+                    (fn [{:keys [error]}] (is (= :dk.simongray.httpsig.sfv/invalid error)))))))
+
 (deftest results-show-no-private-keys
   (let [request {:method :get :url "https://example.com/"}]
     (support/run

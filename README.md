@@ -11,13 +11,14 @@ signatures are made of, and the older
 [draft-cavage](https://datatracker.ietf.org/doc/html/draft-cavage-http-signatures-12)
 signatures that most of the fediverse still sends.
 
-- **The whole standard.** Every component and parameter, the six algorithms
-  of its registry, and several signatures in one message. It passes the
-  RFC's own examples, and signs those of HMAC, Ed25519 and RSA again to the
-  same bytes.
+- **The whole standard.** Every component and parameter but those of
+  trailers, the six algorithms of its registry, and several signatures in
+  one message. It passes the RFC's own examples, and signs those of HMAC,
+  Ed25519 and RSA again to the same bytes.
 - **The fediverse as it is.** It signs and verifies draft-cavage the way
-  Mastodon and the servers that talk to it do, and its sender tries RFC
-  9421 when a server refuses the draft, as Mastodon does.
+  Mastodon and the servers that talk to it do. A sender with both kinds
+  of signer tries RFC 9421 when a server refuses the draft, as Mastodon
+  does.
 - **Safe by default.** The key decides the algorithm, a signature has to
   cover the method, the URL and a digest of the body, and it can be at most
   an hour old.
@@ -127,16 +128,16 @@ someone changed:
 
 The docstring of `httpsig/verify` lists the errors and the options, e.g.
 which components a signature has to cover. The defaults follow sections 3.2
-and 7 of the RFC, and are in `httpsig/default-options`. Replay protection
-needs a store, so check the `:nonce` of a result in yours.
+and 7 of the RFC. Replay protection needs a store, so check the `:nonce`
+of a result in yours.
 
 The fediverse
 -------------
 
 Every server of the fediverse takes draft-cavage signatures, but only some
 take those of RFC 9421. The [`cavage`](src/dk/simongray/httpsig/cavage.cljc)
-namespace signs and verifies the draft as they use it, with the same keys
-and results:
+namespace signs and verifies the draft as they use it, with the same key
+maps and errors:
 
 ```clojure
 (require '[dk.simongray.httpsig.cavage :as cavage])
@@ -194,9 +195,9 @@ sees isn't the one the client signed, so give the public `:origin`. With
 Digest Fields
 -------------
 
-The [`digest`](src/dk/simongray/httpsig/digest.cljc) namespace makes and
-checks a Content-Digest or a Repr-Digest by sha-256 and sha-512, the active
-algorithms of RFC 9530:
+The [`digest`](src/dk/simongray/httpsig/digest.cljc) namespace makes a
+Content-Digest or a Repr-Digest by sha-256 and sha-512, the active
+algorithms of RFC 9530, and checks a Content-Digest:
 
 ```clojure
 (require '[dk.simongray.httpsig.digest :as digest])
@@ -205,7 +206,7 @@ algorithms of RFC 9530:
 ;; => "sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:"
 ```
 
-Use `digest/verify` to check a message's digest against its body, and
+Use `digest/verify` to check a message's Content-Digest against its body, and
 `digest/wanted` for the algorithms that a Want-Content-Digest asks for.
 
 Structured fields
@@ -222,9 +223,10 @@ each item a pair of its value and its parameters:
 ;; => [["sig1" [[["@method" []] ["@path" []]] [["created" 1618884473]]]]]
 ```
 
-A token is a symbol and a byte sequence is bytes. A decimal and a display
-string are records, made by `sfv/decimal` and `sfv/display-string`, since
-JavaScript can't tell 1.0 from 1.
+A token is a symbol and a byte sequence is bytes. A decimal is a record
+that `sfv/decimal` makes, since JavaScript can't tell 1.0 from 1, and a
+display string is one that `sfv/display-string` makes, to tell it from a
+string.
 
 In ClojureScript
 ----------------

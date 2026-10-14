@@ -29,9 +29,10 @@
    :max-bytes (* 10 1024 1024)})
 
 (defn- body-bytes
-  "The bytes of the `body` of a Ring request (a string, bytes, a stream or
-  nothing), or nil when it holds more than `max-bytes`. In ClojureScript a
-  stream gives nil too, so a server there reads the body first."
+  "The `body` of a Ring request (a string, bytes, a stream or nothing) as a
+  map of its :bytes, or of the :error of a body with more than `max-bytes`.
+  In ClojureScript a stream is an error too, so a server there reads the
+  body first."
   [body max-bytes]
   (let [b (cond
             (nil? body)    (bytes/of [])
@@ -40,8 +41,10 @@
                                       body
                                       (.readNBytes ^InputStream body (int (inc max-bytes))))
                               :cljs (when (instance? js/Uint8Array body) body)))]
-    (when (and b (<= (bytes/length b) max-bytes))
-      b)))
+    (cond
+      (nil? b)                        {:error ::httpsig/invalid-body}
+      (> (bytes/length b) max-bytes)  {:error ::httpsig/too-large}
+      :else                           {:bytes b})))
 
 ;; RFC 9110, section 7.2: a Host is a host and maybe a port. A Host with a
 ;; / or a ? in it would move the path of the URL that a signature covers.
@@ -89,7 +92,8 @@
 
   The result is that of httpsig/verify, or of cavage/verify for a request
   without a Signature-Input when :cavage?. A signed request whose body has
-  more than :max-bytes has a result with the :error ::httpsig/too-large.
+  more than :max-bytes has a result with the :error ::httpsig/too-large,
+  and in ClojureScript one whose body is a stream ::httpsig/invalid-body.
   An unsigned request goes on as it came, without ::httpsig/signature and
   with its body unread. The `opts` are those of default-options,
   httpsig/verify and cavage/verify, and :origin, as message takes it."
@@ -103,10 +107,10 @@
             verify (cond
                      (has? "signature-input")                 httpsig/verify
                      (and (:cavage? opts) (has? "signature")) cavage/verify)
-            b      (when verify (body-bytes (:body request) (:max-bytes opts)))]
+            {b :bytes error :error} (when verify (body-bytes (:body request) (:max-bytes opts)))]
         (cond
           (nil? verify) request
-          (nil? b)      (assoc request ::httpsig/signature {:error ::httpsig/too-large})
+          error         (assoc request ::httpsig/signature {:error error})
           :else         (wary-async/then (verify (message request b opts) key-fn opts)
                                          #(assoc (with-body request b) ::httpsig/signature %))))))))
 

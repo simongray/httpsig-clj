@@ -9,8 +9,10 @@
   - a Token is a symbol, e.g. sha-256
   - a Byte Sequence is bytes, as webcrypto-clj has them
   - a Date is an inst of whole seconds
-  - a Decimal and a Display String are records, which decimal and
-    display-string make, since JavaScript can't tell 1.0 from 1
+  - a Decimal is a record that decimal makes, since JavaScript can't tell
+    1.0 from 1
+  - a Display String is a record that display-string makes, to tell it
+    from a String
   - an Item is a pair of its value and its parameters
   - an Inner List is a pair of a vector of items and its parameters
   - a List is a vector of items and inner lists
@@ -48,12 +50,7 @@
       (serialize :item ['sha-256 {\"q\" 1}])
       ;; => \"sha-256;q=1\""
   [type x]
-  (try
-    (impl/serialize type x)
-    (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e
-      (if (= ::impl/invalid (:type (ex-data e)))
-        (throw (ex-info (ex-message e) {:type ::invalid :value x}))
-        (throw e)))))
+  (impl/serialize type x))
 
 (defn decimal
   "The number `x` as a Decimal, which serializes with a point and at most

@@ -300,24 +300,31 @@
       (and expires (> (- t max-skew-seconds) expires)) ::expired)))
 
 (defn- digest-error
-  "The :error of the Content-Digest of the `message` when the signature
-  with the covered component `ids` covers it, or nil."
+  "The error of the Content-Digest of the `message` when the signature with
+  the covered component `ids` covers it, as a map, or nil."
   [message ids]
   (when (covers? ids "content-digest")
     (case (:error (digest/verify message))
-      nil               nil
-      ::digest/missing  ::missing-component
-      ::digest-mismatch)))
+      nil              nil
+      ::digest/missing {:error ::missing-component :component "content-digest"}
+      {:error ::digest-mismatch})))
+
+(defn- error-of
+  "The result of calling `f`, or the error of the ex-info that it throws,
+  as a map of the :error and the :component that it names."
+  [f]
+  (try
+    (f)
+    (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e
+      (let [id (:component (ex-data e))]
+        (cond-> {:error (async/error-type e)}
+          id (assoc :component (component-data id)))))))
 
 (defn- identifier-error
   "The error of the first of the covered component `ids` of a signature of
   the `message` that RFC 9421 doesn't allow, as a map, or nil."
   [message ids]
-  (try
-    (run! #(components/check-identifier % (components/response? message)) ids)
-    nil
-    (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e
-      {:error (async/error-type e) :component (:component (ex-data e))})))
+  (error-of #(run! (fn [id] (components/check-identifier id (components/response? message))) ids)))
 
 (defn- policy-error
   "The first error of the `signature` of the `message` that the library
@@ -330,17 +337,14 @@
                        (some->> (uncovered message components opts)
                                 (hash-map :error ::not-covered :component))
                        (some->> (freshness-error params opts) (hash-map :error))
-                       (some->> (digest-error message components) (hash-map :error)))]
+                       (digest-error message components))]
     (merge {:label label :keyid (param params "keyid")} error)))
 
 (defn- signature-base-of
   "The signature base of the `signature` of the `message`, or a map of the
   :error that keeps it from one."
   [message {:keys [components params]} opts]
-  (try
-    (components/signature-base message components params opts)
-    (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e
-      {:error (async/error-type e) :component (:component (ex-data e))})))
+  (error-of #(components/signature-base message components params opts)))
 
 (defn- key-params
   "The parameters of the `signature` that a key function takes."
@@ -434,14 +438,15 @@
   The result of a signature that verifies is a map of its :label, :keyid,
   :alg, the :key that verified it (without a private key or a secret, so
   that a log can show it), its covered :components, and its :created,
-  :expires, :nonce and :tag. One that doesn't has an :error and
-  the :label and :keyid of the signature, when it has them. The error is
-  one of these:
+  :expires, :nonce and :tag. One that doesn't has an :error, the :label
+  and :keyid of the signature when it has them, and the :component that
+  the error is about when there is one. The error is one of these:
 
   - ::unsigned, for a message without a signature that the options pick
   - ::malformed, for fields or parameters that RFC 9421 doesn't allow
   - ::not-covered, for a component or a created that the policy needs
-  - ::missing-component, for a covered component that the message lacks
+  - ::missing-component, for a covered component that the message lacks,
+    or whose value can't go in a signature base
   - ::expired and ::not-yet-valid, for a signature out of its time
   - ::digest-mismatch, for a body that doesn't match its covered digest
   - ::unknown-key, when `key-fn` gives no key
