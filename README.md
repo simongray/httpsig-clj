@@ -90,7 +90,8 @@ The key material is one of these:
 
 You can hide a PEM or a secret with wary-fetch's `secret/hide`, so that it
 prints as `#<secret>`. Without an `:alg`, the algorithm follows from the
-kind of key, e.g. rsa-v1_5-sha256 for RSA as in Mastodon.
+kind of key, e.g. rsa-v1_5-sha256 for RSA as in Mastodon, and
+rsa-pss-sha512 for a key that OpenSSL marks as RSASSA-PSS.
 
 By default the signature of a request covers its method and URL, and that
 of a response its status. When you pass the `:request` that a response

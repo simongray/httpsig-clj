@@ -19,7 +19,8 @@
     unextractable
 
   Without an :alg, the algorithm follows from the kind of key, e.g.
-  rsa-v1_5-sha256 for RSA as in Mastodon. For verifying, a key map can
+  rsa-v1_5-sha256 for RSA as in Mastodon, and rsa-pss-sha512 for a key of
+  RSASSA-PSS, which can't have another :alg. For verifying, a key map can
   also have the :public-pem of its private key, as generate-key returns
   it.
 

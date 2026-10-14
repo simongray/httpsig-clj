@@ -74,10 +74,12 @@
 (defn kind-algorithm
   "The algorithm of a key with the :kind and :named-curve that
   webcrypto-clj's pem/key-data returns, or nil. An RSA key is
-  rsa-v1_5-sha256, as Mastodon reads it."
+  rsa-v1_5-sha256, as Mastodon reads it, and one of RSASSA-PSS is for
+  rsa-pss-sha512 alone."
   [{:keys [kind named-curve]}]
   (case kind
     :rsa     "rsa-v1_5-sha256"
+    :rsa-pss "rsa-pss-sha512"
     :ec      (curve-algorithms named-curve)
     :ed25519 "ed25519"
     nil))
@@ -176,9 +178,14 @@
 (defn algorithm-of
   "The algorithm of the key map `key`: its :alg, or else that of its
   `material`, the :format and :data of import-key, with the :kind that
-  pem/key-data returns for a PEM key."
-  [{:keys [alg jwk secret]} material]
+  pem/key-data returns for a PEM key. A PEM key of RSASSA-PSS with another
+  :alg throws, since RFC 9421, section 7.3.6, keeps a key to one
+  algorithm."
+  [{:keys [alg jwk secret] :as key} material]
   (cond
+    (and alg (= :rsa-pss (:kind material)) (not= "rsa-pss-sha512" alg))
+    (throw (invalid-key (str "The key is of RSASSA-PSS, so for rsa-pss-sha512 alone, not " alg)))
+
     alg    (check-algorithm alg)
     secret "hmac-sha256"
     jwk    (or (jwk-algorithm (jwk-of jwk))

@@ -324,6 +324,21 @@
                           #(is (= {:error ::httpsig/not-covered :component ["@method" {"req" true}]}
                                   (select-keys % [:error :component]))))])))))))
 
+;; RFC 9421, section 7.3.6, and RFC 4055, section 1.2: the private key of
+;; test-key-rsa-pss is one of RSASSA-PSS, for RSA-PSS alone
+(deftest rsa-pss-keys
+  (let [k       {:keyid "test-key-rsa-pss" :pem examples/rsa-pss-private-pem}
+        request {:method :get :url "https://example.com/"}]
+    (support/run
+     #(support/then (httpsig/sign request k)
+                    (fn [signed]
+                      (is (= "rsa-pss-sha512" (get-in (first (httpsig/signatures signed)) [:params :alg]))
+                          "the kind of key decides without an :alg")
+                      (support/then (httpsig/verify signed (constantly k))
+                                    (fn [result] (is (= "rsa-pss-sha512" (:alg result)) (str (:error result)))))))
+     #(support/then (support/outcome (fn [] (httpsig/sign request (assoc k :alg "rsa-v1_5-sha256"))))
+                    (fn [{:keys [error]}] (is (= ::httpsig/invalid-key error) "another :alg"))))))
+
 (deftest results-show-no-private-keys
   (let [request {:method :get :url "https://example.com/"}]
     (support/run
