@@ -570,11 +570,9 @@
   https one goes unsigned, e.g. one to a relay of Nostr.
 
   A signature covers the URL, so each hop of a redirect needs its own.
-  The request carries a :prepare-fn that signs a hop again, for a client
-  that calls it on the request of each hop before it sends it.
-
-  TODO: wary-fetch has no :prepare-fn yet, so after a redirect a request
-  carries the signature of its first URL."
+  The request carries a :prepare-fn that signs each hop again, which
+  wary-fetch calls before it sends the hop. A browser follows its own
+  redirects, so there only the first hop has a signature."
   ([send key]
    (sender send key {}))
   ([send key opts]

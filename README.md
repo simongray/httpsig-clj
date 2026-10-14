@@ -147,9 +147,9 @@ and results:
 ```
 
 To send requests that a server in authorized-fetch mode answers, wrap
-wary-fetch's `send!` in a sender. It signs each request, and when the
-server answers 400 or 401, it signs the request with the next signer and
-sends it again:
+wary-fetch's `send!` in a sender. It signs each request, and each hop of a
+redirect for its own URL. When the server answers 400 or 401, it signs the
+request with the next signer and sends it again:
 
 ```clojure
 (require '[dk.simongray.wary-fetch :as http])
