@@ -13,7 +13,7 @@
 (defn attempt
   "The outcome of calling `f` as a map of its :value, or of the :error that
   it throws (or in ClojureScript rejects with). On the JVM it waits for a
-  future that `f` returns, and in ClojureScript it gives a promise.
+  future that `f` returns, and in ClojureScript it returns a promise.
 
   Unlike wary-fetch's attempt, it runs `f` on the calling thread."
   [f]

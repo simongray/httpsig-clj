@@ -1,16 +1,15 @@
 (ns dk.simongray.httpsig.cavage
-  "Signatures of draft-cavage-http-signatures, as the fediverse signs and
-  verifies them: the Signature field that Mastodon and the servers that
-  talk to it send.
+  "Signatures of draft-cavage-http-signatures as the fediverse uses them:
+  the Signature field that Mastodon and the servers that talk to it send.
 
   The fediverse uses a profile of the draft that no version describes
   exactly: RSA-SHA256 over a few headers, with a little of the twelfth and
   last version (from 2019), such as hs2019 and (created). This namespace
-  has that profile alone. Its key maps, results and errors are those of
-  the root namespace. Like those of the root namespace, its functions
+  implements that profile and nothing else of the draft. It uses the key
+  maps, results and errors of the root namespace, and its functions also
   return values on the JVM and promises in ClojureScript.
 
-  Every server of the fediverse takes these signatures, and only some take
+  Every fediverse server accepts these signatures, but only some accept
   those of RFC 9421. To sign for both, give httpsig/sender the :signers
   [sign httpsig/sign]."
   (:require [clojure.string :as str]
@@ -30,18 +29,18 @@
 (def default-options
   "The default of each option of sign and signing-string that has one:
 
-  - :algorithm, \"rsa-sha256\": the name that a signature by an RSA key
-    gives its algorithm, as Mastodon, Misskey and WordPress send it, where
-    GoToSocial, Lemmy and Forgejo send hs2019
-  - :query?, true: (request-target) has the query of the URL, as Mastodon
+  - :algorithm, \"rsa-sha256\": the algorithm that a signature by an RSA
+    key names, as Mastodon, Misskey and WordPress send it (GoToSocial,
+    Lemmy and Forgejo send hs2019)
+  - :query?, true: (request-target) includes the URL's query, as Mastodon
     signs it"
   {:algorithm "rsa-sha256"
    :query?    true})
 
 ;; RFC 3230, section 4.3.2, as Mastodon writes it
 (defn digest
-  "The value of a Digest field of RFC 3230 for the `body` (text as UTF-8,
-  bytes or nil): its SHA-256 in base64, after SHA-256=."
+  "The value of an RFC 3230 Digest field for the `body` (text as UTF-8,
+  bytes or nil): SHA-256= and the body's SHA-256 in base64."
   [body]
   (str "SHA-256=" (bytes/base64 (hash/digest :sha-256 (message/body-bytes body)))))
 
@@ -103,7 +102,7 @@
 
 (defn- default-headers
   "The headers that a signature of the `message` covers unless the options
-  give others: (request-target), host and date, and digest when it has a
+  name others: (request-target), host and date, and digest when it has a
   body."
   [message]
   (cond-> ["(request-target)" "host" "date"]
@@ -125,8 +124,8 @@
 (defn- algorithm-name
   "The name of the algorithm of a signature by a key of the algorithm `alg`
   of RFC 9421 over the `headers`, by the :algorithm of `opts`. Only RSA
-  keys sign as rsa-sha256, and the draft and Mastodon take (created) and
-  (expires) only with hs2019."
+  keys sign as rsa-sha256, and the draft and Mastodon accept (created)
+  and (expires) only with hs2019."
   [alg headers opts]
   (if (and (= "rsa-v1_5-sha256" alg)
            (not-any? #{"(created)" "(expires)"} headers))
@@ -135,25 +134,25 @@
 
 ;; draft-cavage-http-signatures-12, sections 2.4 and 4.1
 (defn sign
-  "The `message` signed with the `key` by the `opts` below, as the message
-  with a Signature field (or in ClojureScript a promise of it).
+  "The `message` signed with the `key` by the `opts` below: the message
+  with a Signature field added (in ClojureScript a promise of it).
 
   It signs (request-target), host and date, and digest when the message
   has a body, unless :signed-headers says otherwise. It adds a Date and a
-  Digest when it signs them and the message has none. It rewrites the URL
-  of a request as each platform's client sends it. A browser's fetch
-  forbids a Date field, so this works on the JVM and in Node alone.
+  Digest when it signs them and the message has none. It also rewrites a
+  request's URL as each platform's client sends it. A browser's fetch
+  forbids a Date field, so this works only on the JVM and in Node.
 
   The `opts` are those of default-options, and these:
 
-  - :signed-headers, the headers to sign in order, of the message or among
+  - :signed-headers, the headers to sign in order: the message's own, and
     (request-target), (created) and (expires)
-  - :created and :expires, insts for (created) and (expires), the time now
-    by default for created
+  - :created and :expires, insts for (created) and (expires), with the
+    time now as the default (created)
   - :now-fn, a function that returns the time now
 
   It throws ::httpsig/invalid-key for a keyid with a quote, a backslash
-  or a line break, which the draft can't write."
+  or a line break, which the draft has no way to write."
   ([message key]
    (sign message key {}))
   ([message key opts]
@@ -203,9 +202,9 @@
       [(subs s i end) end])))
 
 ;; draft-cavage-http-signatures-12, section 4.1, as Mastodon's parser reads
-;; it: parameters apart by commas, each a token, = and a token or a quoted
-;; string. A loop rather than a regex, which would backtrack through a long
-;; run of letters at each of them.
+;; it: parameters separated by commas, each a token, = and a token or a
+;; quoted string. A loop rather than a regex, which would backtrack through
+;; a long run of letters at each of them.
 (defn- read-params
   "The parameters of the Signature field `s` as pairs of names and values,
   or a throw when they don't parse."
@@ -223,7 +222,7 @@
       (cond
         (= -1 (sfv/code-at s after))   pairs
         (= 0x2C (sfv/code-at s after)) (recur (sfv/skip s (inc after) sfv/ows) pairs)
-        :else                          (throw (sfv/invalid "Parameters are apart by commas"))))))
+        :else                          (throw (sfv/invalid "Parameters are separated by commas"))))))
 
 (defn- seconds-of
   "The whole seconds of the text `s` of a timestamp, or nil when it isn't
@@ -238,9 +237,9 @@
   :signature as bytes, and :created and :expires as seconds, or of an
   :error when it's malformed.
 
-  As Mastodon does, it takes a Signature prefix that old libraries of Node
-  wrote, and refuses a parameter given twice. It refuses a header signed
-  twice too, which no signer needs."
+  Like Mastodon, it accepts a Signature prefix, which old Node libraries
+  wrote, and refuses a parameter given twice. It also refuses a header
+  signed twice, which no signer needs."
   [s]
   (let [pairs     (try (read-params (str/replace s #"^\s*Signature\s+" ""))
                        (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) _
@@ -272,14 +271,14 @@
        :expires   (seconds-of (get values "expires"))})))
 
 (defn- uncovered
-  "The first header that the policy of `opts` requires a signature of the
-  `message` over the `headers` to cover, and that it doesn't, or nil.
+  "The first header that the `opts` require a signature of the `message`
+  to cover and that its `headers` lack, or nil.
 
-  The :required-headers of `opts` are those that it requires. By default
-  they're Mastodon's, and a little more: date or (created), and
-  (request-target) or digest. Every method but POST needs host, where
-  Mastodon asks it of a GET, and a message with a body needs digest,
-  where Mastodon asks it of a POST."
+  The :required-headers of `opts` replace the default policy, which is
+  Mastodon's and a little more: date or (created), and (request-target) or
+  digest. Every method but POST needs host, where Mastodon requires it
+  only for a GET. A message with a body needs digest, where Mastodon
+  requires it only for a POST."
   [message headers opts]
   (let [covers? #(some #{%} headers)
         method  (str/upper-case (components/method-name message))]
@@ -329,9 +328,8 @@
       (or (empty? digests) (some not digests)) {:error ::httpsig/digest-mismatch})))
 
 (defn- policy-error
-  "The first error of the `signature` of the `message` that the library
-  finds before it looks for a key, as a map of the :error and maybe the
-  :component, or nil."
+  "The first error of the `signature` of the `message` that shows without
+  its key, as a map of the :error and maybe the :component, or nil."
   [message {:keys [algorithm headers] :as signature} opts]
   (or (some->> (:error signature) (hash-map :error))
       (when-not (contains? #{nil "rsa-sha256" "hs2019"} algorithm)
@@ -343,11 +341,11 @@
         (digest-error message))))
 
 (defn- signing-strings
-  "The texts that the `signature` of the `message` can sign by the `opts`,
-  or a map of the :error and the :component that keeps it from them. One
-  has the query of the URL, and for a GET or a HEAD another hasn't, since
-  Mobilizon and Pleroma sign the path alone. A method that changes
-  something has its query signed."
+  "The texts that the `signature` of the `message` may have signed, by the
+  `opts`, or a map of the :error and the :component that prevents them.
+  One includes the URL's query. For a GET or a HEAD, another leaves it
+  out, since Mobilizon and Pleroma sign the path alone. A method that
+  changes something has its query signed."
   [message {:keys [headers created expires]} opts]
   (try
     (let [reads? (contains? #{"GET" "HEAD"} (str/upper-case (components/method-name message)))]
@@ -408,7 +406,7 @@
 ;; draft-cavage-http-signatures-12, section 2.5
 (defn verify
   "The result of verifying the Signature field of the `message` with the
-  key that `key-fn` gives for it, by the `opts` below (or in ClojureScript
+  key that `key-fn` returns for it, by the `opts` below (in ClojureScript
   a promise of it).
 
   The `key-fn` takes the parameters of the signature as a map of its
@@ -424,8 +422,8 @@
   - rsa-sha256, hs2019 or no algorithm at all
   - for a GET or a HEAD, (request-target) with or without the query, since
     Mobilizon and Pleroma sign the path alone
-  - (created) and (expires), and a Signature prefix as old libraries of
-    Node wrote it
+  - (created) and (expires), and a Signature prefix, as old Node libraries
+    wrote it
   - a Digest whose SHA-256 or SHA-512 matches the body, when it's signed
 
   The `opts` are those of httpsig/default-options, and these:

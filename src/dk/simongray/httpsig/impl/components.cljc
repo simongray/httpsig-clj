@@ -50,7 +50,7 @@
 
 (def field-types
   "The type of each structured field that a component with the sf parameter
-  can name, unless the options of a call give more."
+  can name, beside those that the options of a call add."
   {"accept-signature"    :dictionary
    "cache-status"        :list
    "content-digest"      :dictionary

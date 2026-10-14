@@ -2,29 +2,30 @@
   "HTTP Message Signatures by RFC 9421: sign a request or a response, and
   verify the signatures of one.
 
-  A message is a request or a response map of wary-fetch. A request has
-  :method, :url, :headers and :body, and a response has :status, :headers
-  and :body. Header names can be in any case. A value is text, a hidden
-  text of wary-fetch or a vector of them. The body is text, bytes, a
-  hidden text or nil.
+  A message is a request or response map like those of wary-fetch. A
+  request has :method, :url, :headers and :body, and a response has
+  :status, :headers and :body. Header names can be in any case. A header's
+  value is text or a vector of texts, and the body is text, bytes or nil.
+  You can hide any of these texts, and a key's PEM or secret, with
+  wary-fetch's secret/hide.
 
-  A key is a map of its :keyid, its :alg (a name from algorithms) and its
+  A key is a map with a :keyid, an :alg (one of algorithms) and the key
   material, one of these:
 
-  - :pem, the text of a key in PEM: SPKI or PKCS#8, or PKCS#1 and SEC1
+  - :pem, a key in PEM: SPKI or PKCS#8, or PKCS#1 and SEC1
   - :jwk, a JWK as a map
   - :secret, the bytes or the text of a shared secret for hmac-sha256
-  - :key, a key of webcrypto-clj, e.g. a CryptoKey that a page keeps
+  - :key, a webcrypto-clj key, e.g. a CryptoKey that a page keeps
     unextractable
 
-  The material can be a hidden text. A key map without an :alg gets the
-  algorithm of its kind of key, e.g. rsa-v1_5-sha256 for RSA as in
-  Mastodon. To verify, a key map can also have the :public-pem of its
-  private key, as generate-key gives it.
+  Without an :alg, the algorithm follows from the kind of key, e.g.
+  rsa-v1_5-sha256 for RSA as in Mastodon. For verifying, a key map can
+  also have the :public-pem of its private key, as generate-key returns
+  it.
 
-  The functions that sign and verify return their results on the JVM (and
-  promises of them in ClojureScript), since WebCrypto has only promises.
-  Chain them with wary-fetch's async/then on both platforms."
+  The functions that sign and verify return values on the JVM and promises
+  in ClojureScript, since WebCrypto only has promises. Chain them with
+  wary-fetch's async/then to write code for both."
   (:require [clojure.string :as str]
             [dk.simongray.httpsig.digest :as digest]
             [dk.simongray.httpsig.impl.async :as async]
@@ -39,22 +40,22 @@
             [dk.simongray.webcrypto.bytes :as bytes]))
 
 (def algorithms
-  "The names of the algorithms in RFC 9421's registry (section 6.2.2),
-  which the library signs and verifies with. Ed25519 needs Java 15 or
-  later on the JVM."
+  "The names of the algorithms in RFC 9421's registry (section 6.2.2). The
+  library signs and verifies with all of them, though Ed25519 needs Java
+  15 or later on the JVM."
   (set (clojure.core/keys keys/algorithms)))
 
 (def default-options
   "The default of each option of sign and verify that has one:
 
   - :alg?, true: a new signature names its algorithm, which Mastodon
-    ignores but the beta of Gancio wants
-  - :max-age-seconds, 3600: how old a signature can be by its created, an
+    ignores but Gancio's beta requires
+  - :max-age-seconds, 3600: how long ago a signature's created can be, an
     hour as the SWICG report on the fediverse's signatures suggests
   - :max-skew-seconds, 300: how far ahead of the clock its created can be
   - :max-signatures, 3: how many of a message's signatures verify tries
-  - :min-rsa-bits, 2048: the smallest RSA key that verify takes
-  - :algorithms, all of algorithms: those that verify takes"
+  - :min-rsa-bits, 2048: the smallest RSA key that verify accepts
+  - :algorithms, all of algorithms: the algorithms that verify accepts"
   {:alg?             true
    :max-age-seconds  3600
    :max-skew-seconds 300
@@ -72,9 +73,9 @@
 ;; can stand as the answer to any other
 (defn- default-components
   "The components that a signature of the `message` covers unless the
-  `opts` give others: @method and @target-uri of a request, or @status of
-  a response, and those of its request when the :request of `opts` has
-  it. Both cover content-digest when the message has a body."
+  `opts` name others: @method and @target-uri of a request, or @status of
+  a response, plus those of its request when `opts` have the :request.
+  Both cover content-digest when the message has a body."
   [message opts]
   (cond-> (cond
             (not (components/response? message)) ["@method" "@target-uri"]
@@ -141,29 +142,32 @@
 ;; RFC 9421, section 3.1
 (defn sign
   "The `message` signed with the `key` by the `opts` below and
-  default-options, as the message with a Signature-Input and a Signature
-  (or in ClojureScript a promise of it).
+  default-options: the message with a Signature-Input and a Signature
+  added (in ClojureScript a promise of it).
 
-  Unless :components says otherwise, the signature of a request covers
-  @method and @target-uri, and that of a response @status. Given its
-  :request, a response also covers the @method and @target-uri of the
-  request with the req parameter, so that it can't stand as the answer to
-  another. Both cover content-digest when the message has a body. sign
-  adds a Content-Digest when it covers one and the message has none. It
-  also rewrites the URL of a request as each platform's client sends it,
-  so that @target-uri is the URL on the wire.
+  Unless :components says otherwise, a request's signature covers both
+  its @method and its @target-uri, and a response's covers its @status.
+  With :request, a response also covers the method and the URL of the
+  request (as @method and @target-uri with the req parameter), so that
+  nobody can pass it off as the answer to another request. Both cover
+  content-digest when the message has a body.
+
+  It adds a Content-Digest when it covers one and the message has none.
+  It also rewrites a request's URL as each platform's client sends it, so
+  that @target-uri is the URL on the wire.
 
   The `opts` are these:
 
   - :components, the covered components in order, each a name (e.g.
     \"@authority\" or \"content-type\"), or a pair of a name and a map of
     its parameters, e.g. [\"@query-param\" {\"name\" \"Pet\"}]
-  - :label, of the signature, sig1 by default
+  - :label, the signature's label, sig1 by default
   - :created, an inst (the time now by default), or false for none
   - :expires, an inst
   - :nonce and :tag, texts
   - :alg?, whether the signature names its algorithm
-  - :request, the request of a response, for components with req
+  - :request, the request that a response answers, for components with
+    req
   - :field-types, the type of each structured field (e.g. {\"example-dict\"
     :dictionary}) for components with sf
   - :now-fn, a function that returns the time now
@@ -222,7 +226,7 @@
       {:label label :error ::malformed})))
 
 (defn- read-signatures
-  "The signatures of the `message` as read-signature gives them, in the
+  "The signatures of the `message` as read-signature returns them, in the
   order of its Signature-Input, or a map of the :error when it has none or
   they don't parse."
   [message]
@@ -270,16 +274,15 @@
   (some (fn [[k v]] (when-let [type? (param-types k)] (not (type? v)))) params))
 
 (defn- uncovered
-  "The first component that the policy of `opts` requires the signature
-  with the covered component `ids` of the `message` to cover, and that it
-  doesn't, or nil.
+  "The first component that the `opts` require a signature of the
+  `message` to cover and that its covered `ids` lack, or nil.
 
-  The :required-components of `opts` are those that it requires. By
-  default a request covers @method and its whole URL: @target-uri, or
-  @authority with @request-target or with both @path and @query. A
-  response covers @status, and given the :request of `opts`, the same of
-  its request with the req parameter. Both cover content-digest when the
-  message has a body."
+  The :required-components of `opts` replace the default policy. In that,
+  a request covers @method and its whole URL: @target-uri, or @authority
+  with @request-target or with both @path and @query. A response covers
+  its @status, and with the :request of `opts` the same of the request,
+  with the req parameter. Both cover content-digest when the message has
+  a body."
   [message ids opts]
   (let [covered   (set (map components/same-identifier ids))
         has?      #(contains? covered (components/same-identifier (components/identifier %)))
@@ -323,8 +326,8 @@
       (and expires (> (- t max-skew-seconds) expires)) ::expired)))
 
 (defn- digest-error
-  "The error of the Content-Digest of the `message` when the signature with
-  the covered component `ids` covers it, as a map, or nil."
+  "The error of the Content-Digest of the `message` when the covered
+  component `ids` include it, as a map, or nil."
   [message ids]
   (when (covers? ids "content-digest")
     (case (:error (digest/verify message))
@@ -356,9 +359,9 @@
   (merge {:label label :keyid (sfv/value-of params "keyid")} error))
 
 (defn- policy-error
-  "The first error of the `signature` of the `message` that the library
-  finds before it looks for a key, as a map, or nil. Each check runs only
-  when those before it pass."
+  "The first error of the `signature` of the `message` that shows without
+  its key, as a map, or nil. Each check runs only when those before it
+  pass."
   [message {:keys [components params] :as signature} opts]
   (some->> (or (some->> (:error signature) (hash-map :error))
                (when (malformed-params? params) {:error ::malformed})
@@ -417,7 +420,7 @@
 
 (defn- check-signature
   "The result of verifying the `signature` of the `message` with the key
-  that `key-fn` gives for it, by the `opts`."
+  that `key-fn` returns for it, by the `opts`."
   [message key-fn signature opts]
   (let [error (policy-error message signature opts)
         base  (when-not error
@@ -454,7 +457,7 @@
 ;; RFC 9421, section 3.2
 (defn verify
   "The result of verifying a signature of the `message` with the key that
-  `key-fn` gives for it, by the `opts` below and default-options (or in
+  `key-fn` returns for it, by the `opts` below and default-options (in
   ClojureScript a promise of it).
 
   The `key-fn` takes the parameters of a signature as a map of its :label,
@@ -462,45 +465,47 @@
   (or nil, or a future or a promise of either). Return nil for a key that
   you don't know or trust.
 
-  The result of a signature that verifies is a map of its :label, :keyid,
-  :alg, the :key that verified it (without a private key or a secret, so
-  that a log can show it), its covered :components, and its :created,
-  :expires, :nonce and :tag. One that doesn't has an :error, the :label
-  and :keyid of the signature when it has them, and the :component that
-  the error is about when there is one. The error is one of these:
+  It tries at most :max-signatures of the message's signatures, in order.
+  For the first that verifies, the result is a map of its :label, :keyid,
+  :alg, :created, :expires, :nonce and :tag, its covered :components, and
+  the :key that verified it. That key has no private key or secret, so
+  that a log can show it.
+
+  When none verifies, the result has the :error of the first, its :label
+  and :keyid when it has them, and the :component that the error is
+  about, if any. The error is one of these:
 
   - ::unsigned, for a message without a signature that the options pick
   - ::malformed, for fields or parameters that RFC 9421 doesn't allow
   - ::not-covered, for a component or a created that the policy needs
   - ::missing-component, for a covered component that the message lacks,
     or whose value can't go in a signature base
-  - ::expired and ::not-yet-valid, for a signature out of its time
+  - ::expired and ::not-yet-valid, for a signature outside its time
   - ::digest-mismatch, for a body that doesn't match its covered digest
-  - ::unknown-key, when `key-fn` gives no key
-  - ::invalid-key, for a key that doesn't import, or too small
-  - ::unsupported-algorithm, for one that the platform lacks
-  - ::wrong-algorithm, for an alg that disagrees with the key, or isn't
-    one of the :algorithms
+  - ::unknown-key, when `key-fn` returns no key
+  - ::invalid-key, for a key that doesn't import or is too small
+  - ::unsupported-algorithm, for an algorithm that the platform lacks
+  - ::wrong-algorithm, for an alg that doesn't match the key or isn't one
+    of the :algorithms
   - ::invalid-signature, for a signature that doesn't verify
 
-  It tries at most :max-signatures signatures in order and returns the
-  first that verifies, or else the error of the first. The `opts` are
-  those of default-options, and these:
+  The `opts` are those of default-options, and these:
 
   - :label, to verify the signature of this label alone
   - :tag, to verify the signatures with this tag alone
   - :required-components, the components that a signature has to cover,
     in place of the default policy: a request covers @method and its
     whole URL, as @target-uri, or as @authority with @request-target or
-    with both @path and @query. A response covers its @status, and given
-    its :request, the same of the request with the req parameter. Both
-    cover content-digest when the message has a body.
-  - :request, the request of a response, for components with req
+    with both @path and @query. A response covers its @status, and with
+    :request the same of the request, with the req parameter. Both cover
+    content-digest when the message has a body.
+  - :request, the request that a response answers, for components with
+    req
   - :field-types, as sign takes them
   - :now-fn, a function that returns the time now
 
-  This function doesn't check a nonce for replay, since that needs a
-  store. Check the :nonce of the result in yours."
+  It doesn't check a nonce for replays, since that needs a store: check
+  the :nonce of the result against your own."
   ([message key-fn]
    (verify message key-fn {}))
   ([message key-fn opts]
@@ -523,8 +528,9 @@
 
 ;; RFC 9421, section 2.5
 (defn signature-base
-  "The signature base of a signature of the `message` that covers the
-  `components` with the `params`, the text that the signature signs.
+  "The signature base of the `message` for a signature that covers the
+  `components` with the `params`, by the `opts`: the text that the
+  signature signs.
 
   The components are those that sign takes, and the `params` a map or
   pairs of their names and values, e.g. {:created #inst \"…\" :keyid \"k\"}.
@@ -564,8 +570,8 @@
                    [label [(mapv components/identifier components) (params-pairs params)]])))
 
 (def ^:private signature-fields
-  "The fields that a signer adds to a request, in lower case, which a hop
-  of a redirect needs anew."
+  "The fields that a signer adds to a request, in lower case. Each hop of
+  a redirect needs them anew."
   #{"signature" "signature-input" "content-digest" "digest"})
 
 (defn- unsigned
@@ -581,8 +587,8 @@
 
 ;; A server that redirects elsewhere picks the URL of the next hop, so a
 ;; signature for any URL that it likes, with the body of a 307 or a 308,
-;; would make the sender its signing oracle. Mastodon signs every hop, and
-;; a hop to another origin is signed here only when it reads.
+;; would make the sender its signing oracle. Mastodon signs every hop, but
+;; this sender signs a hop to another origin only for a GET or a HEAD.
 (defn- signs-hop?
   "Whether a sender signs the `hop` of a redirect of the `request`: one to
   the same origin, or a GET or a HEAD."
@@ -601,15 +607,15 @@
   It tries each of :signers in turn (sign by default): when the server
   answers 400 or 401, it sends the request again, signed by the next one.
   For the fediverse, [cavage/sign sign] sends draft-cavage first and RFC
-  9421 next, as Mastodon does. A request to any URL but an http or https
-  one goes unsigned, e.g. one to a relay of Nostr.
+  9421 next, as Mastodon does. It sends a request to any URL but an http
+  or https one unsigned, e.g. one to a Nostr relay.
 
   A signature covers the URL, so each hop of a redirect needs its own. The
-  sender gives the request a :prepare-fn, which wary-fetch calls to sign
-  each hop again before sending it. A hop to another origin is signed only
-  when it's a GET or a HEAD, so that a server can't redirect a signed POST
-  to a URL of its choosing. A browser follows its own redirects, so there
-  only the first hop has a signature."
+  sender adds a :prepare-fn to the request, which wary-fetch calls to sign
+  each hop before sending it. It signs a hop to another origin only when
+  it's a GET or a HEAD, so that a server can't redirect a signed POST to a
+  URL of its choosing. A browser follows its own redirects, so there only
+  the first hop has a signature."
   ([send key]
    (sender send key {}))
   ([send key opts]
@@ -635,10 +641,11 @@
            (knock signers)))))))
 
 (defn generate-key
-  "A new key map of the algorithm `alg` with the `keyid` (or in
-  ClojureScript a promise of it). An HMAC key has its :secret, and any
-  other its :pem and the :public-pem to publish, e.g. in an actor
-  document. The secret and the private key are hidden texts.
+  "A new key map of the algorithm `alg` with the `keyid` (in ClojureScript
+  a promise of it). An HMAC key has a :secret, and any other a :pem and
+  the :public-pem to publish, e.g. in an actor document. The secret and
+  the private PEM are hidden with wary-fetch's secret/hide, so they print
+  as #<secret>.
 
       (generate-key \"rsa-v1_5-sha256\" \"https://example.com/actor#main-key\")"
   [alg keyid]

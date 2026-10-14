@@ -1,8 +1,9 @@
 (ns ^:no-doc dk.simongray.httpsig.impl.message
   "The parts of a message that signatures and digests read and write: its
-  fields by name, and its body as bytes. A message is a request or a
-  response map of wary-fetch, whose header names can be in any case and
-  whose values are texts, hidden texts or vectors of them."
+  fields by name, and its body as bytes. A message is a request or
+  response map like those of wary-fetch. Its header names can be in any
+  case, and its values are texts or vectors of them, which wary-fetch's
+  secret/hide may have hidden."
   (:require [clojure.string :as str]
             [dk.simongray.httpsig :as-alias httpsig]
             [dk.simongray.wary-fetch.secret :as secret]
@@ -15,8 +16,9 @@
   (= field-name (str/lower-case (name k))))
 
 (defn field-lines
-  "The values of the field `field-name` in the `headers`, as texts in order,
-  or nil when it has none. Hidden texts count as their texts."
+  "The values of the field `field-name` in the `headers` as plain texts in
+  order, or nil when it has none. A text hidden with secret/hide counts as
+  the text itself."
   [headers field-name]
   (let [field-name (str/lower-case field-name)
         lines      (for [[k v] headers
@@ -38,7 +40,8 @@
 
 (defn body-bytes
   "The bytes of the `body` of a message: text as UTF-8, bytes as they are,
-  and no body as no bytes. A hidden text counts as its text."
+  and no body as no bytes. A text hidden with secret/hide counts as the
+  text itself."
   [body]
   (let [body (secret/reveal body)]
     (cond

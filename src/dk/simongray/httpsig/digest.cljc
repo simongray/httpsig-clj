@@ -2,9 +2,9 @@
   "Digest Fields by RFC 9530: the Content-Digest and Repr-Digest of a body,
   and the Want- fields that ask for them.
 
-  The library computes the digests of the two active algorithms of RFC
-  9530's registry, sha-256 and sha-512. The others are deprecated, and RFC
-  9530 forbids them wherever an attacker may be involved."
+  The library computes sha-256 and sha-512, the two algorithms in RFC
+  9530's registry that aren't deprecated. RFC 9530 forbids the others
+  wherever an attacker may be involved."
   (:require [dk.simongray.httpsig.impl.message :as message]
             [dk.simongray.httpsig.sfv :as sfv]
             [dk.simongray.webcrypto.bytes :as bytes]
@@ -12,8 +12,8 @@
 
 ;; RFC 9530, section 5
 (def algorithms
-  "The hash of each algorithm of RFC 9530's registry that the library
-  computes, by its name in the fields."
+  "The algorithms in RFC 9530's registry that the library computes: each
+  name in the fields, with its hash."
   {"sha-256" :sha-256
    "sha-512" :sha-512})
 
@@ -27,14 +27,13 @@
 
 ;; RFC 9530, sections 2 and 3
 (defn field-value
-  "The value of a Content-Digest or a Repr-Digest of the `body` by the
-  `algorithm-names`, sha-256 alone unless given. The body is text (as
+  "The value of a Content-Digest or a Repr-Digest of the `body` with the
+  `algorithm-names` (sha-256 alone by default). The body is text (as
   UTF-8), bytes or nil.
 
-  A Content-Digest covers the content of a message, so `body` is its body.
-  A Repr-Digest covers the whole representation that it selects, which
-  only you know, e.g. the whole file rather than the range of it that a
-  response holds.
+  For a Content-Digest, the body is the message's body. For a Repr-Digest,
+  it's the whole representation, which only you can give, e.g. the whole
+  file rather than the range of it that a response holds.
 
       (field-value \"{\\\"hello\\\": \\\"world\\\"}\")
       ;; => \"sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:\""
@@ -46,8 +45,8 @@
                                   [a (hash/digest (hash-of a) b)])))))
 
 (defn with-content-digest
-  "The `message` with a Content-Digest of its body by the
-  `algorithm-names`, sha-256 alone unless given."
+  "The `message` with a Content-Digest of its body with the
+  `algorithm-names` (sha-256 alone by default)."
   ([message]
    (with-content-digest message ["sha-256"]))
   ([message algorithm-names]
@@ -72,7 +71,8 @@
 ;; RFC 9530, section 2, and section 6.3 on its use in signatures
 (defn verify
   "The outcome of checking the Content-Digest of the `message` against its
-  body, as a map of the :algorithms that matched, or of an :error.
+  body by the `opts`, as a map of the :algorithms that matched, or of an
+  :error.
 
   Every digest by one of the :algorithms in `opts` (sha-256 and sha-512 by
   default) has to match, and there has to be at least one. The :error is

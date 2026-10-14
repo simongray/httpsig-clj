@@ -2,12 +2,12 @@
   "The keys of signatures: the algorithms of RFC 9421 in webcrypto-clj's
   terms, and the import of a key map's material for signing or verifying.
 
-  A key map has a :keyid, an :alg and its material: a :pem, a :jwk, a
-  :secret or a :key of webcrypto-clj. The functions that import return a
-  map of the :alg and the :key that they imported (or in ClojureScript a
-  promise of it). They throw ::httpsig/invalid-key for material that
-  doesn't import, and ::httpsig/unsupported-algorithm for an algorithm that
-  the library or the platform lacks."
+  A key map has a :keyid, an :alg and the key material: a :pem, a :jwk, a
+  :secret or a webcrypto-clj :key. The functions that import return a map
+  of the :alg and the :key that they imported (in ClojureScript a promise
+  of it). They throw ::httpsig/invalid-key for material that doesn't
+  import, and ::httpsig/unsupported-algorithm for an algorithm that the
+  library or the platform lacks."
   (:require [clojure.string :as str]
             [dk.simongray.httpsig :as-alias httpsig]
             [dk.simongray.httpsig.impl.async :as async]
@@ -72,9 +72,9 @@
    :p-384 "ecdsa-p384-sha384"})
 
 (defn kind-algorithm
-  "The algorithm of a key of the :kind and :named-curve that webcrypto-clj's
-  pem/key-data gives it, or nil. An RSA key is rsa-v1_5-sha256, as
-  Mastodon takes it."
+  "The algorithm of a key with the :kind and :named-curve that
+  webcrypto-clj's pem/key-data returns, or nil. An RSA key is
+  rsa-v1_5-sha256, as Mastodon reads it."
   [{:keys [kind named-curve]}]
   (case kind
     :rsa     "rsa-v1_5-sha256"
@@ -137,8 +137,8 @@
     (assoc :jwk (apply dissoc jwk (mapcat (juxt identity name) private-jwk-members)))))
 
 (defn secret-bytes
-  "The bytes of the shared secret `s`: bytes, or text as UTF-8, hidden or
-  not."
+  "The bytes of the shared secret `s`: bytes, or text as UTF-8, hidden
+  with wary-fetch's secret/hide or not."
   [s]
   (let [s (secret/reveal s)]
     (if (string? s) (bytes/encode s) s)))
@@ -176,7 +176,7 @@
 (defn algorithm-of
   "The algorithm of the key map `key`: its :alg, or else that of its
   `material`, the :format and :data of import-key, with the :kind that
-  pem/key-data gives a PEM key."
+  pem/key-data returns for a PEM key."
   [{:keys [alg jwk secret]} material]
   (cond
     alg    (check-algorithm alg)
@@ -224,7 +224,7 @@
 
 (defn verifying-key
   "The key of the key map `key` to verify with: the public key of a key
-  pair, which a private key in PEM gives too."
+  pair, which it derives from a private key in PEM too."
   [key]
   (async/promised
    #(if (:key key)
@@ -261,7 +261,7 @@
 (defn generate-key
   "A new key map of the algorithm `alg` with the `keyid`: for HMAC its
   :secret, and else its :pem and :public-pem. The secret and the private
-  key are hidden texts."
+  PEM are hidden with wary-fetch's secret/hide."
   [alg keyid]
   (let [{:keys [generate]} (get algorithms (check-algorithm alg))]
     (wary-async/then

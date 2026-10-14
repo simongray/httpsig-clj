@@ -41,9 +41,10 @@
 ;; RFC 9651, section 4.1
 (defn serialize
   "The text of `x` as a field of the `type`: :list, :dictionary or :item.
-  It throws an ex-info of the :type ::invalid for a value that RFC 9651
-  can't serialize, e.g. a string with a line break, or a Decimal with more
-  than 12 digits before its point.
+
+  It throws an ex-info of the :type ::invalid for a value that has no
+  serialization in RFC 9651, e.g. a string with a line break, or a Decimal
+  with more than 12 digits before its point.
 
       (serialize :item ['sha-256 {\"q\" 1}])
       ;; => \"sha-256;q=1\""
