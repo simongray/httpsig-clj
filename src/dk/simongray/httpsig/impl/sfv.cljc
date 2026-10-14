@@ -9,6 +9,7 @@
   it can't serialize."
   (:refer-clojure :exclude [parse-boolean])
   (:require [clojure.string :as str]
+            [dk.simongray.httpsig.impl.date :as date]
             [dk.simongray.httpsig.sfv :as-alias sfv]
             [dk.simongray.webcrypto.bytes :as bytes])
   #?(:clj (:import [java.math BigDecimal]
@@ -62,7 +63,25 @@
                    0x60 0x7C 0x7E}
                  c)))
 
-;; RFC 9651, section 3.1.2: lcalpha / DIGIT / "_" / "-" / "." / "*"
+;; RFC 9651, section 3.3.4
+(defn token-start?
+  "Whether the character `c` can start a Token."
+  [c]
+  (or (alpha? c) (= 0x2A c)))
+
+(defn token-char?
+  "Whether the character `c` can be in a Token after its first: a tchar, a
+  colon or a slash."
+  [c]
+  (or (tchar? c) (= 0x3A c) (= 0x2F c)))
+
+;; RFC 9651, section 3.1.2: lcalpha or "*", and then lcalpha / DIGIT / "_"
+;; / "-" / "." / "*"
+(defn key-start?
+  "Whether the character `c` can start a key."
+  [c]
+  (or (lcalpha? c) (= 0x2A c)))
+
 (defn key-char?
   "Whether the character `c` can be in a key."
   [c]
@@ -101,8 +120,7 @@
 (defn parse-number
   "The number that the decimal digits `s` name, with a sign of `sign`."
   [s sign decimal?]
-  (* sign #?(:clj  (if decimal? (Double/parseDouble s) (Long/parseLong s))
-             :cljs (if decimal? (js/parseFloat s) (js/parseInt s 10)))))
+  (* sign (if decimal? (parse-double s) (parse-long s))))
 
 ;; RFC 9651, section 4.2.4
 (defn parse-integer-or-decimal
@@ -169,15 +187,11 @@
 (defn parse-token
   "A Token at `i` in the text `s`, as a symbol."
   [s i]
-  (let [c (code-at s i)]
-    (when-not (or (alpha? c) (= 0x2A c))
-      (throw (invalid "A Token starts with a letter or *")))
-    (let [end (loop [j (inc i)]
-                (let [c (code-at s j)]
-                  (if (or (tchar? c) (= 0x3A c) (= 0x2F c))
-                    (recur (inc j))
-                    j)))]
-      [(symbol (subs s i end)) end])))
+  (when-not (token-start? (code-at s i))
+    (throw (invalid "A Token starts with a letter or *")))
+  (let [end (loop [j (inc i)]
+              (if (token-char? (code-at s j)) (recur (inc j)) j))]
+    [(symbol (subs s i end)) end]))
 
 (def base64-digits
   "The digits of base64, in the order of their values."
@@ -246,16 +260,10 @@
       (throw (invalid "A Boolean is ?1 or ?0")))))
 
 (def max-date-seconds
-  "The most seconds from the epoch that a Date can be, in either direction,
-  here: those of the largest Date of JavaScript, 8.64e15 milliseconds.
-  RFC 9651 allows larger ones, but every platform refuses what any refuses."
+  "The most seconds from the epoch that a Date can be, in either direction:
+  those of the largest JavaScript Date, 8.64e15 milliseconds. RFC 9651
+  allows larger ones, but every platform refuses what any refuses."
   8640000000000)
-
-(defn instant
-  "The inst `seconds` after the epoch."
-  [seconds]
-  #?(:clj  (java.util.Date. (long (* 1000 seconds)))
-     :cljs (js/Date. (* 1000 seconds))))
 
 ;; RFC 9651, section 4.2.9
 (defn parse-date
@@ -266,7 +274,7 @@
       (throw (invalid "A Date is a number of whole seconds")))
     (when (> (abs n) max-date-seconds)
       (throw (invalid "A Date is beyond what the library takes")))
-    [(instant n) j]))
+    [(date/instant n) j]))
 
 (defn lower-hex?
   "Whether the character `c` is a digit of hexadecimal in lower case."
@@ -338,7 +346,7 @@
   "A key at `i` in the text `s`."
   [s i]
   (let [c (code-at s i)]
-    (when-not (or (lcalpha? c) (= 0x2A c))
+    (when-not (key-start? c)
       (throw (invalid "A key starts with a lower-case letter or *")))
     (let [end (loop [j (inc i)]
                 (if (key-char? (code-at s j)) (recur (inc j)) j))]
@@ -450,22 +458,24 @@
 
 ;; RFC 9651, section 4.2
 (defn parse
-  "The field of the `type` (:list, :dictionary or :item) in the text `s`,
-  or nil when it isn't one."
+  "The field of the `type` (:list, :dictionary or :item) in `s`, the text
+  of the field or its field lines, or nil when it isn't one. Field lines
+  join as one value with commas."
   [type s]
-  (try
-    (when-not (ascii? s)
-      (throw (invalid "A structured field is ASCII")))
-    (let [step  (case type
-                  :list       parse-list
-                  :dictionary parse-dictionary
-                  :item       parse-item)
-          [v i] (step s (skip s 0 sp))]
-      (when (= (skip s i sp) (count s))
-        v))
-    (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e
-      (when-not (= ::sfv/invalid (:type (ex-data e)))
-        (throw e)))))
+  (when-let [s (if (string? s) s (some->> (seq s) (str/join ", ")))]
+    (try
+      (when-not (ascii? s)
+        (throw (invalid "A structured field is ASCII")))
+      (let [step  (case type
+                    :list       parse-list
+                    :dictionary parse-dictionary
+                    :item       parse-item)
+            [v i] (step s (skip s 0 sp))]
+        (when (= (skip s i sp) (count s))
+          v))
+      (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e
+        (when-not (= ::sfv/invalid (:type (ex-data e)))
+          (throw e))))))
 
 ;; RFC 9651, section 4.1.4
 (defn serialize-integer
@@ -542,9 +552,8 @@
   "The text of the Token `sym`, a symbol."
   [sym]
   (let [s (str sym)]
-    (when-not (and (or (alpha? (code-at s 0)) (= 0x2A (code-at s 0)))
-                   (every? #(let [c (code-at s %)] (or (tchar? c) (= 0x3A c) (= 0x2F c)))
-                           (range 1 (count s))))
+    (when-not (and (token-start? (code-at s 0))
+                   (every? #(token-char? (code-at s %)) (range 1 (count s))))
       (throw (invalid (str "A Token is a letter or * and then tchars, colons and slashes, not " s))))
     s))
 
@@ -581,7 +590,7 @@
                           :let [c (bit-and (bytes/at b i) 0xFF)]]
                       (if (or (= 0x25 c) (= 0x22 c) (not (visible? c)))
                         (str "%" (hex-byte c))
-                        #?(:clj (char c) :cljs (js/String.fromCharCode c)))))
+                        (char c))))
          "\"")))
 
 ;; RFC 9651, section 4.1.3.1
@@ -606,21 +615,29 @@
   [k]
   (let [s (if (keyword? k) (subs (str k) 1) (str k))]
     (when-not (and (or (string? k) (keyword? k))
-                   (or (lcalpha? (code-at s 0)) (= 0x2A (code-at s 0)))
+                   (key-start? (code-at s 0))
                    (every? #(key-char? (code-at s %)) (range 1 (count s))))
       (throw (invalid (str "A key is a lower-case letter or * and then lower-case letters, digits, _, -, . and *, not " (pr-str k)))))
     s))
+
+(defn value-of
+  "The value of the key `k` in the `pairs` of Parameters or a Dictionary,
+  or nil."
+  [pairs k]
+  (some (fn [[pk v]] (when (= k pk) v)) pairs))
 
 (defn pairs
   "The pairs of a key and a value in `m`, a map or pairs already."
   [m]
   (cond
-    (nil? m)        []
-    (map? m)        (seq m)
-    (sequential? m) (do (when-not (every? #(and (sequential? %) (= 2 (count %))) m)
-                          (throw (invalid "Parameters and Dictionaries are maps or pairs of a key and a value")))
-                        m)
-    :else           (throw (invalid "Parameters and Dictionaries are maps or pairs of a key and a value"))))
+    (nil? m) []
+    (map? m) (seq m)
+
+    (and (sequential? m) (every? #(and (sequential? %) (= 2 (count %))) m))
+    m
+
+    :else
+    (throw (invalid "Parameters and Dictionaries are maps or pairs of a key and a value"))))
 
 ;; RFC 9651, section 4.1.1.2
 (defn serialize-parameters

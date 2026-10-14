@@ -62,6 +62,11 @@
    "want-content-digest" :dictionary
    "want-repr-digest"    :dictionary})
 
+(defn derived?
+  "Whether the `component-name` names a derived component, not a field."
+  [component-name]
+  (str/starts-with? component-name "@"))
+
 (defn identifier
   "The component `x` as a pair of its name and its parameters as pairs. The
   component is a name, or a pair of a name and its parameters as a map or
@@ -71,14 +76,14 @@
     (when-not (string? component-name)
       (throw (malformed x "A component's name is a string")))
     [(cond-> component-name
-       (not (str/starts-with? component-name "@")) str/lower-case)
+       (not (derived? component-name)) str/lower-case)
      (vec (for [[k v] (sfv/pairs params)]
             [(if (keyword? k) (name k) k) v]))]))
 
 (defn parameter
   "The value of the parameter `k` of the component `id`, or nil."
   [[_ params :as id] k]
-  (some (fn [[pk v]] (when (= k pk) v)) params))
+  (sfv/value-of params k))
 
 ;; RFC 9421, section 2: the order of the parameters doesn't make two
 ;; identifiers different
@@ -97,10 +102,10 @@
       (= "@signature-params" component-name)
       (throw (malformed id "@signature-params can't be a covered component"))
 
-      (and (str/starts-with? component-name "@") (not (contains? derived-names component-name)))
+      (and (derived? component-name) (not (contains? derived-names component-name)))
       (throw (malformed id (str "There's no derived component " component-name)))
 
-      (and (not (str/starts-with? component-name "@"))
+      (and (not (derived? component-name))
            (not= component-name (str/lower-case component-name)))
       (throw (malformed id "The name of a field is in lower case"))
 
@@ -125,7 +130,7 @@
       (and (parameter id "name") (not= "@query-param" component-name))
       (throw (malformed id "Only @query-param has a name"))
 
-      (and (str/starts-with? component-name "@")
+      (and (derived? component-name)
            (or (parameter id "sf") (parameter id "key") (parameter id "bs")))
       (throw (malformed id "A derived component has none of the parameters sf, key and bs"))
 
@@ -254,10 +259,7 @@
   [message]
   (let [u        (some-> (:url message) str url/parse)
         lines-of (memoize #(field-lines message %))
-        parsed   (memoize (fn [field-name type]
-                            (some->> (lines-of field-name)
-                                     (str/join ", ")
-                                     (sfv/parse type))))]
+        parsed   (memoize #(sfv/parse %2 (lines-of %1)))]
     (cond-> (assoc message
                    ::field-lines  lines-of
                    ::parsed-field parsed
@@ -316,7 +318,7 @@
   (let [context (if (parameter id "req")
                   (or request (throw (missing id "The response has no request for the req parameter")))
                   message)]
-    (check-value id (if (str/starts-with? (first id) "@")
+    (check-value id (if (derived? (first id))
                       (derived-value context id)
                       (field-value context id (merge field-types (:field-types opts)))))))
 
@@ -334,11 +336,6 @@
          (check-identifier id (response? message))
          (with-prepared-request opts)))
 
-(defn serialize-identifier
-  "The text of the component `id` in a signature base."
-  [id]
-  (sfv/serialize-item id))
-
 ;; RFC 9421, section 2.5
 (defn signature-base
   "The signature base of the `components` of the `message` with the
@@ -350,7 +347,7 @@
     (when-not (= (count ids) (count (distinct (map same-identifier ids))))
       (throw (malformed nil "A component is covered once")))
     (str (apply str (for [id ids]
-                      (str (serialize-identifier id) ": " (value message id opts) "\n")))
+                      (str (sfv/serialize-item id) ": " (value message id opts) "\n")))
          "\"@signature-params\": " (sfv/serialize-inner-list ids params))))
 
 (defn with-legal-url

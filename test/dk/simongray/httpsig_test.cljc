@@ -4,6 +4,7 @@
                :cljs [cljs.test :refer-macros [deftest is]])
             [clojure.string :as str]
             [dk.simongray.httpsig :as httpsig]
+            [dk.simongray.httpsig.impl.date :as date]
             [dk.simongray.httpsig.rfc9421-examples :as examples]
             [dk.simongray.httpsig.test-support :as support]))
 
@@ -16,7 +17,7 @@
 (defn at
   "A function of the time `seconds` after the epoch, for :now-fn."
   [seconds]
-  (constantly (support/instant seconds)))
+  (constantly (date/instant seconds)))
 
 (defn key-fn
   "The key function of the `keys` by their keyids."
@@ -63,7 +64,7 @@
     (support/then (support/outcome #(httpsig/sign unsigned key
                                                   {:components components
                                                    :label      label
-                                                   :created    (support/instant created)
+                                                   :created    (date/instant created)
                                                    :expires    (:expires params)
                                                    :alg?       (contains? params :alg)}))
                   (fn [{signed :value error :error}]

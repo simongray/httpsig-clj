@@ -4,9 +4,9 @@
 
   A message is a request or a response map of wary-fetch. A request has
   :method, :url, :headers and :body, and a response has :status, :headers
-  and :body. Header names can be in any case, and a value is text, a
-  hidden text of wary-fetch, or a vector of them. The body is text, bytes,
-  a hidden text or nil.
+  and :body. Header names can be in any case. A value is text, a hidden
+  text of wary-fetch or a vector of them. The body is text, bytes, a
+  hidden text or nil.
 
   A key is a map of its :keyid, its :alg (a name from algorithms) and its
   material, one of these:
@@ -15,10 +15,12 @@
   - :jwk, a JWK as a map
   - :secret, the bytes or the text of a shared secret for hmac-sha256
   - :key, a key of webcrypto-clj, e.g. a CryptoKey that a page keeps
+    unextractable
 
-  The material can be a hidden text. Without an :alg, the kind of key
-  decides: RSA is rsa-v1_5-sha256, as in Mastodon. To verify, a key map can
-  also have the :public-pem of its private key, as generate-key gives it.
+  The material can be a hidden text. A key map without an :alg gets the
+  algorithm of its kind of key, e.g. rsa-v1_5-sha256 for RSA as in
+  Mastodon. To verify, a key map can also have the :public-pem of its
+  private key, as generate-key gives it.
 
   The functions that sign and verify return their results on the JVM (and
   promises of them in ClojureScript), since WebCrypto has only promises.
@@ -27,6 +29,7 @@
             [dk.simongray.httpsig.digest :as digest]
             [dk.simongray.httpsig.impl.async :as async]
             [dk.simongray.httpsig.impl.components :as components]
+            [dk.simongray.httpsig.impl.date :as date]
             [dk.simongray.httpsig.impl.keys :as keys]
             [dk.simongray.httpsig.impl.message :as message]
             [dk.simongray.httpsig.impl.sfv :as sfv]
@@ -36,8 +39,8 @@
             [dk.simongray.webcrypto.bytes :as bytes]))
 
 (def algorithms
-  "The names of the algorithms of RFC 9421's registry, section 6.2.2, all
-  of which the library signs and verifies with. Ed25519 needs Java 15 or
+  "The names of the algorithms in RFC 9421's registry (section 6.2.2),
+  which the library signs and verifies with. Ed25519 needs Java 15 or
   later on the JVM."
   (set (clojure.core/keys keys/algorithms)))
 
@@ -51,25 +54,13 @@
   - :max-skew-seconds, 300: how far ahead of the clock its created can be
   - :max-signatures, 3: how many of a message's signatures verify tries
   - :min-rsa-bits, 2048: the smallest RSA key that verify takes
-  - :algorithms, the algorithms that verify takes, all of algorithms"
+  - :algorithms, all of algorithms: those that verify takes"
   {:alg?             true
    :max-age-seconds  3600
    :max-skew-seconds 300
    :max-signatures   3
    :min-rsa-bits     2048
    :algorithms       algorithms})
-
-(defn- now
-  "The time now as an inst, by the :now-fn of `opts` when it has one."
-  [opts]
-  (if-let [now-fn (:now-fn opts)]
-    (now-fn)
-    #?(:clj (java.util.Date.) :cljs (js/Date.))))
-
-(defn- seconds
-  "The whole seconds of the inst `t` since the epoch."
-  [t]
-  (quot (inst-ms t) 1000))
 
 (defn- default-components
   "The components that a signature of the `message` covers unless the
@@ -85,17 +76,26 @@
   [ids component-name]
   (some #(= component-name (first %)) ids))
 
+(defn- with-covered-digest
+  "The `message` with a Content-Digest of its body when the component
+  identifiers `ids` cover one and it has none."
+  [message ids]
+  (cond-> message
+    (and (covers? ids "content-digest")
+         (nil? (message/field-lines (:headers message) "content-digest")))
+    digest/with-content-digest))
+
 ;; RFC 9421, section 2.3
 (defn- signature-params
   "The parameters of a new signature by the `key` with the algorithm `alg`,
   as pairs, in the order of the RFC's examples."
   [key alg {:keys [created expires nonce tag alg?] :as opts}]
-  (let [created (if (some? created) created (now opts))]
+  (let [created (if (some? created) created (date/now opts))]
     (cond-> []
-      created      (conj ["created" (seconds created)])
+      created      (conj ["created" (date/seconds created)])
       (:keyid key) (conj ["keyid" (:keyid key)])
       alg?         (conj ["alg" alg])
-      expires      (conj ["expires" (seconds expires)])
+      expires      (conj ["expires" (date/seconds expires)])
       nonce        (conj ["nonce" nonce])
       tag          (conj ["tag" tag]))))
 
@@ -104,7 +104,7 @@
   when it doesn't parse."
   [message field-name]
   (if-let [lines (message/field-lines (:headers message) field-name)]
-    (or (sfv/parse :dictionary (str/join ", " lines))
+    (or (sfv/parse :dictionary lines)
         (throw (ex-info (str "The message's " field-name " isn't a Dictionary")
                         {:type ::malformed})))
     []))
@@ -132,11 +132,12 @@
   default-options, as the message with a Signature-Input and a Signature
   (or in ClojureScript a promise of it).
 
-  A request covers @method and @target-uri unless :components says
-  otherwise, and a response @status, as well as content-digest when it has
-  a body. A Content-Digest of the body is added when a covered
-  content-digest needs it. The URL of a request is written as the client
-  of each platform sends it, so that @target-uri is the URL on the wire.
+  Unless :components says otherwise, the signature of a request covers
+  @method and @target-uri, and that of a response @status. Both cover
+  content-digest when the message has a body. sign adds a Content-Digest
+  when it covers one and the message has none. It also rewrites the URL of
+  a request as each platform's client sends it, so that @target-uri is the
+  URL on the wire.
 
   The `opts` are these:
 
@@ -144,14 +145,14 @@
     \"@authority\" or \"content-type\"), or a pair of a name and a map of
     its parameters, e.g. [\"@query-param\" {\"name\" \"Pet\"}]
   - :label, of the signature, sig1 by default
-  - :created, an inst, or false for none, the time now by default
+  - :created, an inst (the time now by default), or false for none
   - :expires, an inst
   - :nonce and :tag, texts
   - :alg?, whether the signature names its algorithm
   - :request, the request of a response, for components with req
   - :field-types, the type of each structured field (e.g. {\"example-dict\"
     :dictionary}) for components with sf
-  - :now-fn, a function that gives the time now
+  - :now-fn, a function that returns the time now
 
   It throws an ex-info with a :type for a message that it can't sign, e.g.
   ::missing-component for a covered field that the message lacks."
@@ -162,11 +163,9 @@
     (fn []
       (let [opts    (merge default-options opts)
             message (components/with-legal-url message)
-            ids     (mapv components/identifier (or (:components opts) (default-components message)))
-            message (cond-> message
-                      (and (covers? ids "content-digest")
-                           (nil? (message/field-lines (:headers message) "content-digest")))
-                      digest/with-content-digest)]
+            ids     (mapv components/identifier
+                          (or (:components opts) (default-components message)))
+            message (with-covered-digest message ids)]
         (wary-async/then
          (keys/signing-key key)
          (fn [{:keys [alg] :as signer}]
@@ -182,13 +181,13 @@
   [params]
   (into {} (for [[k v] params]
              [(keyword k) (if (and (#{"created" "expires"} k) (integer? v))
-                            (sfv/instant v)
+                            (date/instant v)
                             v)])))
 
 (defn- component-data
   "The component identifier `id` as a name, or a pair of its name and a map
   of its parameters."
-  [[component-name params]]
+  [[component-name params :as id]]
   (if (empty? params)
     component-name
     [component-name (into {} params)]))
@@ -213,23 +212,24 @@
   order of its Signature-Input, or a map of the :error when it has none or
   they don't parse."
   [message]
-  (let [input-lines     (message/field-lines (:headers message) "signature-input")
-        signature-lines (message/field-lines (:headers message) "signature")
-        inputs          (some->> input-lines (str/join ", ") (sfv/parse :dictionary))
-        values          (some->> signature-lines (str/join ", ") (sfv/parse :dictionary) (into {}))]
+  (let [input-lines (message/field-lines (:headers message) "signature-input")
+        inputs      (sfv/parse :dictionary input-lines)
+        values      (some->> (message/field-lines (:headers message) "signature")
+                             (sfv/parse :dictionary)
+                             (into {}))]
     (cond
-      (nil? input-lines)                 {:error ::unsigned}
-      (or (nil? inputs) (nil? values))   {:error ::malformed}
-      :else                              (or (seq (for [[label member] inputs
-                                                        :when (contains? values label)]
-                                                    (read-signature label member (get values label))))
-                                             {:error ::malformed}))))
+      (nil? input-lines)               {:error ::unsigned}
+      (or (nil? inputs) (nil? values)) {:error ::malformed}
+      :else                            (or (seq (for [[label member] inputs
+                                                      :when (contains? values label)]
+                                                  (read-signature label member (get values label))))
+                                           {:error ::malformed}))))
 
 (defn signatures
-  "The signatures of the `message` that are well formed, in order, as maps
-  of their :label, their :components, their :params (with keywords for
-  their names, and insts for created and expires) and their :signature as
-  bytes, e.g. to read a keyid before verify. It verifies nothing."
+  "The well-formed signatures of the `message` in order, without verifying
+  them, e.g. to read a keyid before verify. Each is a map of its :label,
+  :components, :params (by keyword, with insts for created and expires)
+  and its :signature as bytes."
   [message]
   (let [found (read-signatures message)]
     (if (map? found)
@@ -240,17 +240,20 @@
                  (update :components #(mapv component-data %))
                  (update :params params-data)))))))
 
-(defn- param
-  "The value of the signature parameter `k` in the `params`, as pairs."
-  [params k]
-  (some (fn [[pk v]] (when (= k pk) v)) params))
+;; RFC 9421, section 2.3
+(def ^:private param-types
+  "The type of the value of each signature parameter."
+  {"created" integer?
+   "expires" integer?
+   "keyid"   string?
+   "alg"     string?
+   "nonce"   string?
+   "tag"     string?})
 
 (defn- malformed-params?
-  "Whether the signature `params` of RFC 9421, section 2.3, have values of
-  the wrong types."
+  "Whether the signature `params` have values of the wrong types."
   [params]
-  (or (some #(and (some? (param params %)) (not (integer? (param params %)))) ["created" "expires"])
-      (some #(and (some? (param params %)) (not (string? (param params %)))) ["keyid" "alg" "nonce" "tag"])))
+  (some (fn [[k v]] (when-let [type? (param-types k)] (not (type? v)))) params))
 
 (defn- uncovered
   "The first component that the policy of `opts` requires the signature
@@ -263,19 +266,20 @@
   response covers @status. Both cover content-digest when the message has
   a body."
   [message ids opts]
-  (let [covered (set (map components/same-identifier ids))
-        has?    #(contains? covered (components/same-identifier (components/identifier %)))]
+  (let [covered   (set (map components/same-identifier ids))
+        has?      #(contains? covered (components/same-identifier (components/identifier %)))
+        response? (components/response? message)]
     (if-let [required (:required-components opts)]
       (first (remove has? required))
       (cond
-        (and (components/response? message) (not (has? "@status")))
+        (and response? (not (has? "@status")))
         "@status"
 
-        (and (not (components/response? message)) (not (has? "@method")))
+        (and (not response?) (not (has? "@method")))
         "@method"
 
         ;; @path alone would leave the query to anyone who changes it
-        (and (not (components/response? message))
+        (and (not response?)
              (not (has? "@target-uri"))
              (not (and (has? "@authority")
                        (or (has? "@request-target") (and (has? "@path") (has? "@query"))))))
@@ -290,13 +294,13 @@
   when it's fresh: created at most :max-age-seconds ago and at most
   :max-skew-seconds ahead, and not expired."
   [params {:keys [max-age-seconds max-skew-seconds] :as opts}]
-  (let [t       (seconds (now opts))
-        created (param params "created")
-        expires (param params "expires")]
+  (let [t       (date/seconds (date/now opts))
+        created (sfv/value-of params "created")
+        expires (sfv/value-of params "expires")]
     (cond
-      (nil? created)                            ::not-covered
-      (> (- t created) max-age-seconds)         ::expired
-      (> (- created t) max-skew-seconds)        ::not-yet-valid
+      (nil? created)                                   ::not-covered
+      (> (- t created) max-age-seconds)                ::expired
+      (> (- created t) max-skew-seconds)               ::not-yet-valid
       (and expires (> (- t max-skew-seconds) expires)) ::expired)))
 
 (defn- digest-error
@@ -326,47 +330,45 @@
   [message ids]
   (error-of #(run! (fn [id] (components/check-identifier id (components/response? message))) ids)))
 
+(defn- failure
+  "The result of the `signature` that fails with the `error`, a map of the
+  :error and maybe the :component."
+  [{:keys [label params] :as signature} error]
+  (merge {:label label :keyid (sfv/value-of params "keyid")} error))
+
 (defn- policy-error
   "The first error of the `signature` of the `message` that the library
   finds before it looks for a key, as a map, or nil. Each check runs only
   when those before it pass."
-  [message {:keys [label components params] :as signature} opts]
-  (when-let [error (or (some->> (:error signature) (hash-map :error))
-                       (when (malformed-params? params) {:error ::malformed})
-                       (identifier-error message components)
-                       (some->> (uncovered message components opts)
-                                (hash-map :error ::not-covered :component))
-                       (some->> (freshness-error params opts) (hash-map :error))
-                       (digest-error message components))]
-    (merge {:label label :keyid (param params "keyid")} error)))
-
-(defn- signature-base-of
-  "The signature base of the `signature` of the `message`, or a map of the
-  :error that keeps it from one."
-  [message {:keys [components params]} opts]
-  (error-of #(components/signature-base message components params opts)))
+  [message {:keys [components params] :as signature} opts]
+  (some->> (or (some->> (:error signature) (hash-map :error))
+               (when (malformed-params? params) {:error ::malformed})
+               (identifier-error message components)
+               (some->> (uncovered message components opts)
+                        (hash-map :error ::not-covered :component))
+               (some->> (freshness-error params opts) (hash-map :error))
+               (digest-error message components))
+           (failure signature)))
 
 (defn- key-params
   "The parameters of the `signature` that a key function takes."
-  [{:keys [label params]}]
+  [{:keys [label params] :as signature}]
   (assoc (params-data params) :label label))
 
 (defn- key-error
   "The :error of the key `verifier` (a map of its :alg and :key) for the
   `signature` by the `opts`, or nil."
-  [{:keys [alg key]} {:keys [params]} {:keys [algorithms min-rsa-bits]}]
-  (let [named (param params "alg")
-        bits  (keys/modulus-bits key)]
-    (cond
-      ;; RFC 9421, section 3.2, step 6.5, and section 7.3.6
-      (and named (not= named alg))       ::wrong-algorithm
-      (not (contains? algorithms alg))   ::wrong-algorithm
-      (and bits (< bits min-rsa-bits))   ::invalid-key)))
+  [{:keys [alg] :as verifier} {:keys [params] :as signature} opts]
+  (let [named (sfv/value-of params "alg")]
+    ;; RFC 9421, section 3.2, step 6.5, and section 7.3.6
+    (if (and named (not= named alg))
+      ::wrong-algorithm
+      (keys/policy-error verifier opts))))
 
 (defn- result-of
   "The result of a verified `signature` with the key map `key` that the
   `verifier` imported."
-  [{:keys [label components params]} key {:keys [alg]}]
+  [{:keys [label components params] :as signature} key {:keys [alg] :as verifier}]
   (merge {:label      label
           :alg        alg
           :key        (keys/shown key)
@@ -374,40 +376,37 @@
          (select-keys (params-data params) [:keyid :created :expires :nonce :tag])))
 
 (defn- verified
-  "The result of verifying the `signature` of the `message` with the base
-  `base` and the key map `key`, as a map with an :error when it fails."
+  "The result of verifying the `signature` with the signature base `base`
+  and the key map `key`, as a map with an :error when it fails."
   [signature base key opts]
-  (let [failure (fn [error] {:label (:label signature) :keyid (param (:params signature) "keyid") :error error})]
-    (if (nil? key)
-      (failure ::unknown-key)
-      (wary-async/then
-       (async/attempt #(keys/verifying-key key))
-       (fn [{verifier :value e :error}]
-         (cond
-           e
-           (failure (if (= ::unsupported-algorithm (async/error-type e)) ::unsupported-algorithm ::invalid-key))
-
-           (key-error verifier signature opts)
-           (failure (key-error verifier signature opts))
-
-           :else
-           (wary-async/then
-            (async/attempt #(webcrypto/verify (:sign (get keys/algorithms (:alg verifier)))
-                                              (:key verifier) (:signature signature) (bytes/encode base)))
-            (fn [{:keys [value]}]
-              (if (true? value)
-                (result-of signature key verifier)
-                (failure ::invalid-signature))))))))))
+  (if (nil? key)
+    (failure signature {:error ::unknown-key})
+    (wary-async/then
+     (async/attempt #(keys/verifying-key key))
+     (fn [{verifier :value e :error}]
+       (if-let [error (if e (keys/import-error e) (key-error verifier signature opts))]
+         (failure signature {:error error})
+         (wary-async/then
+          (async/attempt #(webcrypto/verify (:sign (get keys/algorithms (:alg verifier)))
+                                            (:key verifier)
+                                            (:signature signature)
+                                            (bytes/encode base)))
+          (fn [{:keys [value]}]
+            (if (true? value)
+              (result-of signature key verifier)
+              (failure signature {:error ::invalid-signature})))))))))
 
 (defn- check-signature
   "The result of verifying the `signature` of the `message` with the key
   that `key-fn` gives for it, by the `opts`."
   [message key-fn signature opts]
   (let [error (policy-error message signature opts)
-        base  (when-not error (signature-base-of message signature opts))]
+        base  (when-not error
+                (error-of #(components/signature-base message (:components signature)
+                                                      (:params signature) opts)))]
     (cond
       error       error
-      (map? base) (merge {:label (:label signature) :keyid (param (:params signature) "keyid")} base)
+      (map? base) (failure signature base)
       :else       (wary-async/then (key-fn (key-params signature))
                                    #(verified signature base % opts)))))
 
@@ -423,6 +422,15 @@
                                  (seq more)            (step more (or first-error result))
                                  :else                 (or first-error result)))))]
     (step signatures nil)))
+
+(defn- picked
+  "The signatures of `found` that the :label, :tag and :max-signatures of
+  `opts` pick."
+  [found {:keys [label tag max-signatures]}]
+  (cond->> found
+    label (filter #(= label (:label %)))
+    tag   (filter #(= tag (sfv/value-of (:params %) "tag")))
+    true  (take max-signatures)))
 
 ;; RFC 9421, section 3.2
 (defn verify
@@ -456,9 +464,9 @@
     one of the :algorithms
   - ::invalid-signature, for a signature that doesn't verify
 
-  The verifier tries the signatures in order, up to :max-signatures, and
-  takes the first that verifies, or else the error of the first. The
-  `opts` are those of default-options, and these:
+  It tries at most :max-signatures signatures in order and returns the
+  first that verifies, or else the error of the first. The `opts` are
+  those of default-options, and these:
 
   - :label, to verify the signature of this label alone
   - :tag, to verify the signatures with this tag alone
@@ -469,33 +477,29 @@
     content-digest when the message has a body.
   - :request, the request of a response, for components with req
   - :field-types, as sign takes them
-  - :now-fn, a function that gives the time now
+  - :now-fn, a function that returns the time now
 
-  A nonce isn't checked for replay, since that needs a store. Check the
-  :nonce of the result in yours."
+  This function doesn't check a nonce for replay, since that needs a
+  store. Check the :nonce of the result in yours."
   ([message key-fn]
    (verify message key-fn {}))
   ([message key-fn opts]
    (async/promised
     (fn []
-      (let [opts  (merge default-options opts)
-            found (read-signatures message)]
-        (if (map? found)
-          found
-          (let [picked (cond->> found
-                         (:label opts) (filter #(= (:label opts) (:label %)))
-                         (:tag opts)   (filter #(= (:tag opts) (param (:params %) "tag"))))]
-            (if (empty? picked)
-              {:error ::unsigned}
-              (first-verified #(check-signature message key-fn % opts)
-                              (take (:max-signatures opts) picked))))))))))
+      (let [opts   (merge default-options opts)
+            found  (read-signatures message)
+            chosen (when-not (map? found) (picked found opts))]
+        (cond
+          (map? found)    found
+          (empty? chosen) {:error ::unsigned}
+          :else           (first-verified #(check-signature message key-fn % opts) chosen)))))))
 
 (defn- params-pairs
   "The signature parameters `params`, a map or pairs with names as strings
   or keywords, as pairs of RFC 9421's terms."
   [params]
   (vec (for [[k v] (sfv/pairs params)]
-         [(name k) (if (inst? v) (seconds v) v)])))
+         [(name k) (if (inst? v) (date/seconds v) v)])))
 
 ;; RFC 9421, section 2.5
 (defn signature-base
@@ -526,37 +530,34 @@
 
 ;; RFC 9421, section 5.1
 (defn accept-signature
-  "The value of an Accept-Signature field that asks for the signatures of
-  `requests`, a map or pairs of a label and a map of the :components to
-  cover and the :params to give, e.g. {\"sig1\" {:components [\"@method\"]
-  :params {:keyid \"k\" :created true}}}. A parameter of true asks for one
-  of the signer's choosing."
+  "The value of an Accept-Signature field that asks for the signatures in
+  `requests`, by label. Each is a map of the :components to cover and the
+  :params to include, e.g.
+
+      {\"sig1\" {:components [\"@method\"]
+                :params     {:keyid \"k\" :created true}}}
+
+  A parameter of true asks the signer to choose its value."
   [requests]
   (sfv/serialize :dictionary
                  (for [[label {:keys [components params]}] (sfv/pairs requests)]
-                   [label [(mapv components/identifier components)
-                           (vec (for [[k v] (sfv/pairs params)] [(name k) v]))]])))
+                   [label [(mapv components/identifier components) (params-pairs params)]])))
 
-(def ^:no-doc signature-fields
-  "The fields that a signer adds to a request, which a hop of a redirect
-  needs anew."
-  ["Signature" "Signature-Input" "Content-Digest" "Digest"])
+(def ^:private signature-fields
+  "The fields that a signer adds to a request, in lower case, which a hop
+  of a redirect needs anew."
+  #{"signature" "signature-input" "content-digest" "digest"})
 
 (defn- unsigned
   "The `request` without the fields that a signature added to it, and with
   its :query-params in its URL, as wary-fetch sends it."
   [{:keys [query-params] :as request}]
-  (cond-> (update request :headers #(into {} (remove (fn [[k _]]
-                                                       (some (fn [f] (message/field-name? (str/lower-case f) k))
-                                                             signature-fields)))
-                                              %))
+  (cond-> (update request :headers
+                  (fn [headers]
+                    (into {} (remove #(contains? signature-fields (str/lower-case (name (key %)))))
+                          headers)))
     query-params (-> (update :url wary-url/with-query query-params)
                      (dissoc :query-params))))
-
-(defn- web-request?
-  "Whether the `request` goes to an http or https URL."
-  [request]
-  (contains? #{"http" "https"} (some-> (:url request) str (str/split #":" 2) first str/lower-case)))
 
 ;; A server that redirects elsewhere picks the URL of the next hop, so a
 ;; signature for any URL that it likes, with the body of a 307 or a 308,
@@ -577,24 +578,24 @@
       (def send-signed!
         (sender http/send! actor-key))
 
-  Each signer of :signers (sign by default) is tried in turn: when the
-  server answers 400 or 401, the request goes again with the next
-  signature. For the fediverse, [cavage/sign sign] sends draft-cavage first
-  and RFC 9421 next, as Mastodon does. A request to any URL but an http or
-  https one goes unsigned, e.g. one to a relay of Nostr.
+  It tries each of :signers in turn (sign by default): when the server
+  answers 400 or 401, it sends the request again, signed by the next one.
+  For the fediverse, [cavage/sign sign] sends draft-cavage first and RFC
+  9421 next, as Mastodon does. A request to any URL but an http or https
+  one goes unsigned, e.g. one to a relay of Nostr.
 
-  A signature covers the URL, so each hop of a redirect needs its own.
-  The request carries a :prepare-fn that signs each hop again, which
-  wary-fetch calls before it sends the hop. A hop to another origin is
-  signed only when it's a GET or a HEAD, so that a server can't redirect
-  a signed POST to a URL of its choosing. A browser follows its own
-  redirects, so there only the first hop has a signature."
+  A signature covers the URL, so each hop of a redirect needs its own. The
+  sender gives the request a :prepare-fn, which wary-fetch calls to sign
+  each hop again before sending it. A hop to another origin is signed only
+  when it's a GET or a HEAD, so that a server can't redirect a signed POST
+  to a URL of its choosing. A browser follows its own redirects, so there
+  only the first hop has a signature."
   ([send key]
    (sender send key {}))
   ([send key opts]
    (let [signers (:signers opts [sign])]
      (fn [request]
-       (if-not (web-request? request)
+       (if-not (contains? #{"http" "https"} (wary-url/scheme (:url request)))
          (send request)
          (letfn [(knock [[signer & more]]
                    (let [sign-hop (fn [hop]

@@ -7,7 +7,7 @@
             #?(:clj [clojure.data.json :as json])
             [clojure.string :as str]
             #?(:clj [clojure.walk :as walk])
-            [dk.simongray.httpsig.impl.sfv :as impl]
+            [dk.simongray.httpsig.impl.date :as date]
             [dk.simongray.httpsig.sfv :as sfv]
             [dk.simongray.httpsig.test-support :as support]
             [dk.simongray.webcrypto.bytes :as bytes]))
@@ -71,7 +71,7 @@
         "decimal"       (sfv/decimal v)
         "token"         (symbol v)
         "binary"        (base32-bytes v)
-        "date"          (impl/instant v)
+        "date"          (date/instant v)
         "displaystring" (sfv/display-string v)))
     (cond->> x
       (sequential? x) (mapv expected-value))))

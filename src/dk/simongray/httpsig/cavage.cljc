@@ -6,9 +6,9 @@
   The fediverse uses a profile of the draft that no version describes
   exactly: RSA-SHA256 over a few headers, with a little of the twelfth and
   last version (from 2019), such as hs2019 and (created). This namespace
-  has that profile alone. Its keys, results and errors are those of the
-  root namespace, and so is its sync or async: values on the JVM, and
-  promises in ClojureScript.
+  has that profile alone. Its key maps, results and errors are those of
+  the root namespace. Like those of the root namespace, its functions
+  return values on the JVM and promises in ClojureScript.
 
   Every server of the fediverse takes these signatures, and only some take
   those of RFC 9421. To sign for both, give httpsig/sender the :signers
@@ -45,23 +45,10 @@
   [body]
   (str "SHA-256=" (bytes/base64 (hash/digest :sha-256 (message/body-bytes body)))))
 
-(defn- now
-  "The time now as an inst, by the :now-fn of `opts` when it has one."
-  [opts]
-  (if-let [now-fn (:now-fn opts)]
-    (now-fn)
-    #?(:clj (java.util.Date.) :cljs (js/Date.))))
-
-(defn- seconds
-  "The whole seconds of the inst `t` since the epoch."
-  [t]
-  (quot (inst-ms t) 1000))
-
 (defn- missing
   "The exception of the header `header-name` that the message lacks."
   [header-name]
-  (ex-info (str "The message has no " header-name)
-           {:type ::httpsig/missing-component :component header-name}))
+  (components/missing header-name (str "The message has no " header-name)))
 
 (defn- request-target
   "The value of (request-target) of the `message`: its method in lower case
@@ -90,11 +77,12 @@
 
 (defn signing-string
   "The text that a signature over the `headers` of the `message` signs,
-  e.g. [\"(request-target)\" \"host\" \"date\"], with the signature `params`
-  :created and :expires as seconds, and the :query? of `opts`.
+  with the :created and :expires of `params` in seconds and the :query? of
+  `opts`.
 
-  A Host that the message lacks comes from its URL, since every client
-  sets that Host itself."
+  The headers are names in order, e.g. [\"(request-target)\" \"host\"
+  \"date\"]. A Host that the message lacks comes from its URL, since every
+  client sets that Host itself."
   ([message headers]
    (signing-string message headers {} {}))
   ([message headers params opts]
@@ -113,13 +101,26 @@
                   true    (conj (str "headers=\"" (str/join " " headers) "\"")
                                 (str "signature=\"" (bytes/base64 signature) "\"")))))
 
-(defn- signed-headers
+(defn- default-headers
   "The headers that a signature of the `message` covers unless the options
   give others: (request-target), host and date, and digest when it has a
   body."
   [message]
   (cond-> ["(request-target)" "host" "date"]
     (some? (:body message)) (conj "digest")))
+
+(defn- with-signed-fields
+  "The `message` with the Date and the Digest that the `headers` cover and
+  it lacks, by the :now-fn of `opts`."
+  [message headers opts]
+  (let [covers? #(some #{%} headers)
+        absent? #(nil? (message/field-lines (:headers message) %))]
+    (cond-> message
+      (and (covers? "date") (absent? "date"))
+      (message/with-field "Date" (date/imf-fixdate (date/now opts)))
+
+      (and (covers? "digest") (absent? "digest"))
+      (message/with-field "Digest" (digest (:body message))))))
 
 (defn- algorithm-name
   "The name of the algorithm of a signature by a key of the algorithm `alg`
@@ -138,10 +139,10 @@
   with a Signature field (or in ClojureScript a promise of it).
 
   It signs (request-target), host and date, and digest when the message
-  has a body, unless :signed-headers says otherwise. It adds the Date and
-  the Digest that a signed header needs. The URL of a request is written
-  as the client of each platform sends it. A browser's fetch forbids a
-  Date field, so this works on the JVM and in Node alone.
+  has a body, unless :signed-headers says otherwise. It adds a Date and a
+  Digest when it signs them and the message has none. It rewrites the URL
+  of a request as each platform's client sends it. A browser's fetch
+  forbids a Date field, so this works on the JVM and in Node alone.
 
   The `opts` are those of default-options, and these:
 
@@ -149,7 +150,7 @@
     (request-target), (created) and (expires)
   - :created and :expires, insts for (created) and (expires), the time now
     by default for created
-  - :now-fn, a function that gives the time now
+  - :now-fn, a function that returns the time now
 
   It throws ::httpsig/invalid-key for a keyid with a quote, a backslash
   or a line break, which the draft can't write."
@@ -162,19 +163,17 @@
       (when (re-find #"[\"\\\r\n]" (str (:keyid key)))
         (throw (keys/invalid-key "A keyId has no quotes, backslashes or line breaks")))
       (let [opts    (merge default-options opts)
-            message (components/with-legal-url message)
-            headers (mapv str/lower-case (or (:signed-headers opts) (signed-headers message)))
+            headers (mapv str/lower-case (or (:signed-headers opts) (default-headers message)))
+            message (-> (components/with-legal-url message)
+                        (with-signed-fields headers opts))
             covers? #(some #{%} headers)
-            absent? #(nil? (message/field-lines (:headers message) %))
-            message (cond-> message
-                      (and (covers? "date") (absent? "date"))
-                      (message/with-field "Date" (date/imf-fixdate (now opts)))
-
-                      (and (covers? "digest") (absent? "digest"))
-                      (message/with-field "Digest" (digest (:body message))))
             params  (cond-> {}
-                      (covers? "(created)") (assoc :created (seconds (or (:created opts) (now opts))))
-                      (covers? "(expires)") (assoc :expires (seconds (or (:expires opts) (throw (missing "(expires)"))))))]
+                      (covers? "(created)")
+                      (assoc :created (date/seconds (or (:created opts) (date/now opts))))
+
+                      (covers? "(expires)")
+                      (assoc :expires (date/seconds (or (:expires opts)
+                                                        (throw (missing "(expires)"))))))]
         (wary-async/then
          (keys/signing-key key)
          (fn [{:keys [alg] :as signer}]
@@ -216,7 +215,8 @@
     (let [name-end    (tchars-end s i)
           _           (when (= i name-end)
                         (throw (sfv/invalid "A parameter has a name")))
-          equals      (sfv/expect s (sfv/skip s name-end sfv/ows) 0x3D "A parameter's name goes before =")
+          equals      (sfv/expect s (sfv/skip s name-end sfv/ows) 0x3D
+                                  "A parameter's name goes before =")
           [value end] (read-value s (sfv/skip s equals sfv/ows))
           pairs       (conj pairs [(subs s i name-end) value])
           after       (sfv/skip s end sfv/ows)]
@@ -242,31 +242,32 @@
   wrote, and refuses a parameter given twice. It refuses a header signed
   twice too, which no signer needs."
   [s]
-  (let [pairs  (try (read-params (str/replace s #"^\s*Signature\s+" ""))
-                    (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) _
-                      nil))
-        names  (map first pairs)
-        values (into {} pairs)
-        alg    (get values "algorithm")
-        heads  (if-let [h (get values "headers")]
-                 (str/split (str/lower-case (str/trim h)) #"\s+")
-                 ;; section 2.1.6, and date for rsa-sha256 as Mastodon has it
-                 (if (or (nil? alg) (= "hs2019" alg)) ["(created)"] ["date"]))]
+  (let [pairs     (try (read-params (str/replace s #"^\s*Signature\s+" ""))
+                       (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) _
+                         nil))
+        names     (map first pairs)
+        values    (into {} pairs)
+        alg       (get values "algorithm")
+        signature (some-> (get values "signature") bytes/from-base64)
+        headers   (if-let [h (get values "headers")]
+                    (str/split (str/lower-case (str/trim h)) #"\s+")
+                    ;; section 2.1.6, and date for rsa-sha256 as Mastodon has it
+                    (if (or (nil? alg) (= "hs2019" alg)) ["(created)"] ["date"]))]
     (cond
       (or (nil? pairs) (not= (count names) (count (distinct names))))
       {:error ::httpsig/malformed}
 
       (or (nil? (get values "keyId"))
-          (nil? (some-> (get values "signature") bytes/from-base64))
-          (= [""] heads)
-          (not= (count heads) (count (distinct heads))))
+          (nil? signature)
+          (= [""] headers)
+          (not= (count headers) (count (distinct headers))))
       {:error ::httpsig/malformed :keyid (get values "keyId")}
 
       :else
       {:keyid     (get values "keyId")
        :algorithm alg
-       :headers   heads
-       :signature (bytes/from-base64 (get values "signature"))
+       :headers   headers
+       :signature signature
        :created   (seconds-of (get values "created"))
        :expires   (seconds-of (get values "expires"))})))
 
@@ -296,12 +297,12 @@
   when it's fresh. Its time is its (created) when it covers one, and else
   its Date."
   [message {:keys [headers created expires]} {:keys [max-age-seconds max-skew-seconds] :as opts}]
-  (let [t        (seconds (now opts))
+  (let [t        (date/seconds (date/now opts))
         created? (some #{"(created)"} headers)
-        date     (when-not created? (first (message/field-lines (:headers message) "date")))
-        time     (if created? created (some-> date date/parse seconds))]
+        line     (when-not created? (first (message/field-lines (:headers message) "date")))
+        time     (if created? created (some-> line date/parse date/seconds))]
     (cond
-      (and (not created?) (nil? date)) {:error ::httpsig/missing-component :component "date"}
+      (and (not created?) (nil? line)) {:error ::httpsig/missing-component :component "date"}
       (nil? time)                      {:error ::httpsig/malformed}
       (> (- t time) max-age-seconds)   {:error ::httpsig/expired}
       (> (- time t) max-skew-seconds)  {:error ::httpsig/not-yet-valid}
@@ -359,13 +360,11 @@
 (defn- key-error
   "The :error of the key `verifier` (a map of its :alg and :key) for the
   `signature` by the `opts`, or nil."
-  [{:keys [alg key]} {:keys [algorithm]} {:keys [algorithms min-rsa-bits]}]
-  (let [bits (keys/modulus-bits key)]
-    (cond
-      ;; section 2.1.3: a named algorithm that disagrees with the key fails
-      (and (= "rsa-sha256" algorithm) (not= "rsa-v1_5-sha256" alg)) ::httpsig/wrong-algorithm
-      (not (contains? algorithms alg))                              ::httpsig/wrong-algorithm
-      (and bits (< bits min-rsa-bits))                              ::httpsig/invalid-key)))
+  [{:keys [alg] :as verifier} {:keys [algorithm] :as signature} opts]
+  ;; section 2.1.3: a named algorithm that disagrees with the key fails
+  (if (and (= "rsa-sha256" algorithm) (not= "rsa-v1_5-sha256" alg))
+    ::httpsig/wrong-algorithm
+    (keys/policy-error verifier opts)))
 
 (defn- verifies?
   "Whether the `signature` verifies with the key `verifier` over one of the
@@ -378,6 +377,17 @@
                       #(true? (:value %))))
                    strings))
 
+(defn- result-of
+  "The result of a verified `signature` with the key map `key` that the
+  `verifier` imported."
+  [{:keys [keyid headers created expires] :as signature} key {:keys [alg] :as verifier}]
+  (cond-> {:keyid      keyid
+           :alg        alg
+           :key        (keys/shown key)
+           :components headers}
+    created (assoc :created (date/instant created))
+    expires (assoc :expires (date/instant expires))))
+
 (defn- verified
   "The result of verifying the `signature` over one of the signing
   `strings` with the key map `key`."
@@ -388,24 +398,11 @@
       (wary-async/then
        (async/attempt #(keys/verifying-key key))
        (fn [{verifier :value e :error}]
-         (cond
-           e
-           (failure (if (= ::httpsig/unsupported-algorithm (async/error-type e))
-                      ::httpsig/unsupported-algorithm
-                      ::httpsig/invalid-key))
-
-           (key-error verifier signature opts)
-           (failure (key-error verifier signature opts))
-
-           :else
+         (if-let [error (if e (keys/import-error e) (key-error verifier signature opts))]
+           (failure error)
            (wary-async/then (verifies? signature strings verifier)
                             #(if %
-                               (cond-> {:keyid      (:keyid signature)
-                                        :alg        (:alg verifier)
-                                        :key        (keys/shown key)
-                                        :components (:headers signature)}
-                                 (:created signature) (assoc :created (sfv/instant (:created signature)))
-                                 (:expires signature) (assoc :expires (sfv/instant (:expires signature))))
+                               (result-of signature key verifier)
                                (failure ::httpsig/invalid-signature)))))))))
 
 ;; draft-cavage-http-signatures-12, section 2.5
@@ -415,13 +412,14 @@
   a promise of it).
 
   The `key-fn` takes the parameters of the signature as a map of its
-  :keyid and :algorithm, and returns a key map (or nil, or a future or a
-  promise of either), as httpsig/verify takes it. The key decides the
-  algorithm, so hs2019 is RSA-SHA256 for an RSA key, as the fediverse
-  reads it, and Ed25519 for an Ed25519 key, which GoToSocial tries too.
+  :keyid and :algorithm (the draft's name, e.g. hs2019, rather than an
+  :alg of RFC 9421), and returns a key map (or nil, or a future or a
+  promise of either), as httpsig/verify takes it. The algorithm comes from
+  the key: hs2019 means RSA-SHA256 for an RSA key (as the fediverse reads
+  it) and Ed25519 for an Ed25519 key (which GoToSocial also tries).
 
-  The result is a map like that of httpsig/verify, whose :components are
-  the signed headers, and the errors are the same. The verifier takes:
+  The result is a map like that of httpsig/verify, with the signed headers
+  as its :components. The errors are the same. A signature can have:
 
   - rsa-sha256, hs2019 or no algorithm at all
   - for a GET or a HEAD, (request-target) with or without the query, since
@@ -435,7 +433,7 @@
   - :required-headers, the headers that a signature has to cover, in place
     of the default: date or (created), (request-target) or digest, host
     for any method but POST, and digest for a message with a body
-  - :now-fn, a function that gives the time now
+  - :now-fn, a function that returns the time now
 
   The signature's time is its (created) when it covers one, and else its
   Date, which has to be IMF-fixdate."

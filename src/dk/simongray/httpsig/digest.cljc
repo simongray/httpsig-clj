@@ -56,29 +56,27 @@
 
 (defn- check-digest
   "The `result` of a verification with the digest by `algorithm-name` that
-  the field names as `value`, checked against the bytes `b`."
-  [result b [algorithm-name [value]]]
+  the field names as `value`, checked against the bytes `b`, and reduced
+  when it fails."
+  [b result [algorithm-name [value]]]
   (cond
-    (:error result)
-    result
-
     (not (bytes/bytes? value))
-    {:error ::malformed}
+    (reduced {:error ::malformed})
 
     (bytes/same? value (hash/digest (hash-of algorithm-name) b))
     (update result :algorithms conj algorithm-name)
 
     :else
-    {:error ::mismatch :algorithm algorithm-name}))
+    (reduced {:error ::mismatch :algorithm algorithm-name})))
 
 ;; RFC 9530, section 2, and section 6.3 on its use in signatures
 (defn verify
   "The outcome of checking the Content-Digest of the `message` against its
   body, as a map of the :algorithms that matched, or of an :error.
 
-  Each digest by an algorithm of the :algorithms in `opts` (a set of names,
-  sha-256 and sha-512 by default) has to match, and at least one has to be
-  there. The :error is one of these:
+  Every digest by one of the :algorithms in `opts` (sha-256 and sha-512 by
+  default) has to match, and there has to be at least one. The :error is
+  one of these:
 
   - ::missing, for a message without a Content-Digest
   - ::malformed, for one that isn't a Dictionary of Byte Sequences
@@ -89,21 +87,21 @@
    (verify message {}))
   ([message {accepted :algorithms :or {accepted (set (keys algorithms))} :as opts}]
    (let [lines (message/field-lines (:headers message) "content-digest")
-         field (some->> lines (sfv/parse :dictionary))
+         field (sfv/parse :dictionary lines)
          known (filter #(contains? accepted (first %)) field)]
      (cond
        (nil? lines) {:error ::missing}
        (nil? field) {:error ::malformed}
        (empty? known) {:error ::unsupported-algorithm}
-       :else (reduce #(check-digest %1 (message/body-bytes (:body message)) %2)
+       :else (reduce (partial check-digest (message/body-bytes (:body message)))
                      {:algorithms []}
                      known)))))
 
 ;; RFC 9530, section 4
 (defn wanted
-  "The names of the algorithms that the value `s` of a Want-Content-Digest
-  or a Want-Repr-Digest asks for, most wanted first, of those that the
-  library computes. The value is text or field lines.
+  "The names of the algorithms that the Want-Content-Digest or
+  Want-Repr-Digest `s` asks for and the library computes, most wanted
+  first. The field is text or field lines.
 
       (wanted \"sha-512=3, sha-256=10, unixsum=0\")
       ;; => [\"sha-256\" \"sha-512\"]"

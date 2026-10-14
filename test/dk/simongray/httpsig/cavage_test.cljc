@@ -154,7 +154,7 @@
                                        #(is (= ::httpsig/wrong-algorithm %)))
                          (support/then (error-of (assoc signed :body "{\"type\": \"Block\"}"))
                                        #(is (= ::httpsig/digest-mismatch %)))
-                         (support/then (error-of signed {:now-fn (constantly (support/instant 4102444800))})
+                         (support/then (error-of signed {:now-fn (constantly (date/instant 4102444800))})
                                        #(is (= ::httpsig/expired %)))
                          (support/then (error-of (assoc-in signed [:headers "Host"] "elsewhere.example"))
                                        #(is (= ::httpsig/invalid-signature %)))

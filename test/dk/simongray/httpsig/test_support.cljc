@@ -85,12 +85,6 @@
                false))
      :cljs true))
 
-(defn instant
-  "The inst `seconds` after the epoch."
-  [seconds]
-  #?(:clj  (java.util.Date. (long (* 1000 seconds)))
-     :cljs (js/Date. (* 1000 seconds))))
-
 (defn byte-values
   "The bytes `b` as a vector of numbers from 0 to 255, which compare by
   value on both platforms."

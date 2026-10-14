@@ -4,6 +4,7 @@
   response map of wary-fetch, whose header names can be in any case and
   whose values are texts, hidden texts or vectors of them."
   (:require [clojure.string :as str]
+            [dk.simongray.httpsig :as-alias httpsig]
             [dk.simongray.wary-fetch.secret :as secret]
             [dk.simongray.webcrypto.bytes :as bytes]))
 
@@ -45,7 +46,7 @@
       (string? body)      (bytes/encode body)
       (bytes/bytes? body) body
       :else               (throw (ex-info "The body of a message to sign or digest is text or bytes, not a stream or a collection"
-                                          {:type :dk.simongray.httpsig/invalid-body})))))
+                                          {:type ::httpsig/invalid-body})))))
 
 (defn has-body?
   "Whether the `message` has a body of at least one byte."

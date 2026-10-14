@@ -66,6 +66,11 @@
     (throw (unsupported alg (str "The algorithms of RFC 9421 are " (pr-str (sort (keys algorithms)))
                                  ", not " (pr-str alg))))))
 
+(def curve-algorithms
+  "The algorithm of ECDSA on each curve, by webcrypto-clj's name for it."
+  {:p-256 "ecdsa-p256-sha256"
+   :p-384 "ecdsa-p384-sha384"})
+
 (defn kind-algorithm
   "The algorithm of a key of the :kind and :named-curve that webcrypto-clj's
   pem/key-data gives it, or nil. An RSA key is rsa-v1_5-sha256, as
@@ -73,7 +78,7 @@
   [{:keys [kind named-curve]}]
   (case kind
     :rsa     "rsa-v1_5-sha256"
-    :ec      (case named-curve :p-256 "ecdsa-p256-sha256" :p-384 "ecdsa-p384-sha384" nil)
+    :ec      (curve-algorithms named-curve)
     :ed25519 "ed25519"
     nil))
 
@@ -96,13 +101,13 @@
       :rsassa-pkcs1-v1_5 (when (= :sha-256 hash) "rsa-v1_5-sha256")
       :rsa-pss           (when (= :sha-512 hash) "rsa-pss-sha512")
       :hmac              (when (= :sha-256 hash) "hmac-sha256")
-      :ecdsa             (case named-curve :p-256 "ecdsa-p256-sha256" :p-384 "ecdsa-p384-sha384" nil)
+      :ecdsa             (curve-algorithms named-curve)
       :ed25519           "ed25519"
       nil)))
 
 (defn jwk-of
   "The JWK `jwk` with its members as keywords, and without the members that
-  limit its use, which the library decides."
+  limit its use, since the library sets the usages itself."
   [jwk]
   (-> (update-keys jwk keyword)
       (dissoc :key_ops :use :ext)))
@@ -148,10 +153,10 @@
     (or value (throw (invalid-key "The PEM holds no key that the library reads" error)))))
 
 (defn translated
-  "The exception of webcrypto-clj `e` of an import for the algorithm `alg`,
-  as one of the library's own."
+  "The library's own exception for `e`, the exception of webcrypto-clj
+  when it imports a key for the algorithm `alg`."
   [e alg]
-  (if (= :dk.simongray.webcrypto/not-supported-error (async/error-type e))
+  (if (= ::webcrypto/not-supported-error (async/error-type e))
     (unsupported alg (str "The platform lacks " alg ": " (ex-message e)))
     (invalid-key (str "The key isn't one of " alg ": " (ex-message e)) e)))
 
@@ -222,19 +227,35 @@
   pair, which a private key in PEM gives too."
   [key]
   (async/promised
-   (fn []
-     (let [{:keys [format] :as m} (when-not (:key key) (material key true))]
-       (cond
-         (:key key)        (given-key key)
-         (= :pkcs8 format) (wary-async/then (imported m (algorithm-of key m) [:sign] true)
-                                            public-of)
-         :else             (imported m (algorithm-of key m) [:verify]))))))
+   #(if (:key key)
+      (given-key key)
+      (let [{:keys [format] :as m} (material key true)
+            alg                    (algorithm-of key m)]
+        (if (= :pkcs8 format)
+          (wary-async/then (imported m alg [:sign] true) public-of)
+          (imported m alg [:verify]))))))
 
 (defn modulus-bits
   "The bits of the modulus of the RSA key `k` of webcrypto-clj, or nil for
   a key of another kind."
   [k]
   (get-in (webcrypto/key-info k) [:algorithm :modulus-length]))
+
+(defn import-error
+  "The :error of a key map whose import for verifying threw `e`."
+  [e]
+  (if (= ::httpsig/unsupported-algorithm (async/error-type e))
+    ::httpsig/unsupported-algorithm
+    ::httpsig/invalid-key))
+
+(defn policy-error
+  "The :error of the imported key `verifier`, a map of its :alg and :key,
+  that the :algorithms and :min-rsa-bits of `opts` refuse, or nil."
+  [{:keys [alg key] :as verifier} {:keys [algorithms min-rsa-bits] :as opts}]
+  (let [bits (modulus-bits key)]
+    (cond
+      (not (contains? algorithms alg)) ::httpsig/wrong-algorithm
+      (and bits (< bits min-rsa-bits)) ::httpsig/invalid-key)))
 
 ;; PEM labels, RFC 7468, section 10 and 11
 (defn generate-key
@@ -248,8 +269,8 @@
      (fn [{generated :value e :error}]
        (cond
          ;; e.g. Ed25519 below Java 15
-         (= :dk.simongray.webcrypto/not-supported-error (async/error-type e))
-         (throw (unsupported alg (str "The platform lacks " alg ": " (ex-message e))))
+         (= ::webcrypto/not-supported-error (async/error-type e))
+         (throw (translated e alg))
 
          e
          (throw e)

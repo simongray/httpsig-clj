@@ -5,9 +5,9 @@ httpsig-clj
 
 This library signs and verifies HTTP requests and responses in Clojure and
 ClojureScript, by [HTTP Message Signatures](https://www.rfc-editor.org/rfc/rfc9421)
-(RFC 9421). It also has the [Digest Fields](https://www.rfc-editor.org/rfc/rfc9530)
-and [structured fields](https://www.rfc-editor.org/rfc/rfc9651) that those
-signatures are made of, and the older
+(RFC 9421). It also implements [Digest Fields](https://www.rfc-editor.org/rfc/rfc9530)
+and [structured fields](https://www.rfc-editor.org/rfc/rfc9651), which those
+signatures build on, as well as the older
 [draft-cavage](https://datatracker.ietf.org/doc/html/draft-cavage-http-signatures-12)
 signatures that most of the fediverse still sends.
 
@@ -19,11 +19,11 @@ signatures that most of the fediverse still sends.
   Mastodon and the servers that talk to it do. A sender with both kinds
   of signer tries RFC 9421 when a server refuses the draft, as Mastodon
   does.
-- **Safe by default.** The key decides the algorithm, a signature has to
-  cover the method, the URL and a digest of the body, and it can be at most
-  an hour old.
-- **Errors as data.** A signature that doesn't verify gives a map with the
-  reason.
+- **Safe by default.** The algorithm comes from the key, not the
+  signature. A signature has to be at most an hour old and cover the
+  method, the URL and a digest of the body.
+- **Errors as data.** Verifying returns a map with the reason when a
+  signature fails.
 - **The same results everywhere.** One codebase runs on the JVM, in Node
   and in browsers, with the cryptography of
   [webcrypto-clj](https://github.com/simongray/webcrypto-clj). Its
@@ -56,8 +56,8 @@ Signing
 -------
 
 A message is a request or a response map of
-[wary-fetch](https://github.com/simongray/wary-fetch), and a key is a map
-of its `:keyid`, its `:alg` and its material. Make a key with
+[wary-fetch](https://github.com/simongray/wary-fetch). A key is a map of
+its `:keyid`, its `:alg` and its material. Make a key with
 `httpsig/generate-key`, and publish its `:public-pem`, e.g. in an actor
 document:
 
@@ -91,13 +91,14 @@ The material of a key is one of these:
   unextractable
 
 A PEM and a secret can be hidden texts of wary-fetch's `secret` namespace.
-Without an `:alg`, the kind of key decides, and an RSA key is
-rsa-v1_5-sha256, as Mastodon takes it.
+Without an `:alg`, the algorithm follows from the kind of key, e.g.
+rsa-v1_5-sha256 for RSA as in Mastodon.
 
-A request covers its method and its URL by default, and a response its
-status, plus a digest of the body when there is one. Give `:components` to
-cover others, e.g. `["@authority" "@path" "content-type"]`. The docstring
-of `httpsig/sign` has the other options.
+By default the signature of a request covers its method and URL, and that
+of a response its status. Both cover a digest of the body when there is
+one. Give `:components` to cover more, e.g. `["@method" "@target-uri"
+"content-type" "content-digest"]`. The docstring of `httpsig/sign` has the
+other options.
 
 Verifying
 ---------
@@ -116,8 +117,8 @@ also return a future or a promise, e.g. of a key that it fetches:
 ;;     :created    #inst "2026-10-14T06:45:08.000-00:00"}
 ```
 
-A signature that fails gives a map with the `:error`, e.g. for a body that
-someone changed:
+When a signature fails, the map has its `:error` instead, e.g. for a body
+that someone changed:
 
 ```clojure
 (httpsig/verify (assoc signed :body "{}") (constantly actor-key))
@@ -164,14 +165,15 @@ the request with the next signer and sends it again:
                :headers {"Accept" "application/activity+json"}})
 ```
 
-This order needs no memory of servers. Trying RFC 9421 first would fail
+This order works without remembering which server takes which signature.
+Trying RFC 9421 first would fail
 silently with Misskey and Sharkey, which answer a bad signature with a
 stripped-down actor and a 200. A server checks a signature by fetching the
 actor of its keyid, so publish that actor where anyone can read it without
 a signature.
 
-A server
---------
+Ring
+----
 
 The [`ring`](src/dk/simongray/httpsig/ring.cljc) namespace verifies Ring
 requests. Use `ring/verified` in a Pedestal interceptor, or the middleware
@@ -187,10 +189,12 @@ requests. Use `ring/verified` in a Pedestal interceptor, or the middleware
                      :cavage? true}))
 ```
 
-The handler gets the result under `:dk.simongray.httpsig/signature`, and
+The handler gets the result under `:dk.simongray.httpsig/signature`. It
 can read the body again. Behind a proxy that ends TLS, the URL that Ring
-sees isn't the one the client signed, so give the public `:origin`. With
-`:cavage?`, a request without a Signature-Input is checked as draft-cavage.
+sees isn't the one the client signed, so give the public `:origin`.
+Without it, the URL comes from the Host, which has to be a host and maybe
+a port. With `:cavage?`, the middleware checks a request without a
+Signature-Input as draft-cavage.
 
 Digest Fields
 -------------
@@ -250,8 +254,9 @@ Principles
   comment says which server does what.
 - **Plain data.** Messages are maps that any HTTP client can send, keys are
   maps, and the results of a verification are maps.
-- **Safe by default.** The defaults take a signature that RFC 9421 and the
-  fediverse would take, and no other.
+- **Strict by default.** The defaults accept only what RFC 9421 and the
+  fediverse would accept. A stranger's fields take time in proportion to
+  their length, never more.
 - **One codebase.** The library is written in `.cljc` and passes the same
   tests on the JVM, in Node and in a browser.
 
@@ -281,8 +286,9 @@ The internal ones are under `impl`:
 - `impl.components`, the components and the signature base
 - `impl.keys`, the keys and the algorithms in webcrypto-clj's terms
 - `impl.sfv`, the parsing and serializing of structured fields
-- `impl.message`, `impl.date` and `impl.async`, the fields of a message,
-  HTTP dates, and the errors of promises
+- `impl.message`, the fields and the body of a message
+- `impl.date`, the time now, seconds since the epoch, and IMF-fixdate
+- `impl.async`, values on the JVM and promises in ClojureScript
 
 License
 -------

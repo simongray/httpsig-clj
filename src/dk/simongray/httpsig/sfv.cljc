@@ -21,8 +21,7 @@
 
   To serialize, an item without parameters can be its value alone, and
   Parameters and a Dictionary can be maps."
-  (:require [clojure.string :as str]
-            [dk.simongray.httpsig.impl.sfv :as impl]))
+  (:require [dk.simongray.httpsig.impl.sfv :as impl]))
 
 ;; RFC 9651, section 4.2
 (defn parse
@@ -30,15 +29,14 @@
   :list, :dictionary or :item, and `s` is the text of the field or its
   field lines, which join as one value with commas.
 
-  A field that doesn't parse should be ignored, as RFC 9651 says. A Byte
-  Sequence parses without its padding, with too much of it, and with pad
-  bits that aren't zero.
+  It returns nil rather than throwing, since RFC 9651 says to ignore a
+  field that doesn't parse. A Byte Sequence parses without its padding,
+  with too much of it, and with pad bits that aren't zero.
 
       (parse :dictionary \"sig1=(\\\"@method\\\");created=1618884473\")
       ;; => [[\"sig1\" [[[\"@method\" []]] [[\"created\" 1618884473]]]]]"
   [type s]
-  (some->> (if (string? s) s (some->> (seq s) (str/join ", ")))
-           (impl/parse type)))
+  (impl/parse type s))
 
 ;; RFC 9651, section 4.1
 (defn serialize

@@ -66,11 +66,12 @@
       (re-matches host-pattern host) (str scheme host))))
 
 (defn message
-  "The Ring `request` as a message of the root namespace, with its body as
-  `b`, the bytes of its body. Its URL has the :origin of `opts`, or else
-  its scheme and its Host, and is nil when the Host isn't a host and a
-  port. Behind a proxy that ends TLS, the URL that Ring sees isn't the one
-  the client signed, so give the public origin there, e.g.
+  "The Ring `request` as a message that httpsig/verify takes, with the
+  bytes `b` as its body and the :origin of `opts` (or its scheme and Host)
+  in its URL. The URL is nil when the Host isn't a host and a port.
+
+  Behind a proxy that ends TLS, the URL that Ring sees isn't the one the
+  client signed, so give the public origin there, e.g.
   https://example.com."
   [{:keys [request-method uri query-string headers] :as request} b opts]
   {:method  request-method
@@ -115,10 +116,10 @@
                                          #(assoc (with-body request b) ::httpsig/signature %))))))))
 
 (defn- refusal
-  "The Ring response to a request whose signature has the `error`, or none
-  when the :required? of `opts` asks for one, with the :accept-signature of
-  `opts`, a value of an Accept-Signature field (RFC 9421, section 5) that
-  says what to sign."
+  "The Ring response that refuses a request whose signature has the
+  `error` (nil when it's unsigned), with the :accept-signature of `opts`.
+  That is the value of an Accept-Signature field (RFC 9421, section 5),
+  which says what to sign."
   [error opts]
   (if (= ::httpsig/too-large error)
     {:status 413 :headers {"Content-Type" "text/plain"} :body "The body is too large"}
@@ -134,7 +135,7 @@
   when it has none and :required? says it needs one, or else nil."
   [request opts]
   (let [{:keys [error] :as result} (::httpsig/signature request)]
-    (when (or error (and (nil? result) (:required? (merge default-options opts))))
+    (when (or error (and (nil? result) (:required? opts)))
       (refusal error opts))))
 
 (defn wrap-verify
@@ -155,17 +156,19 @@
   ([handler key-fn]
    (wrap-verify handler key-fn {}))
   ([handler key-fn opts]
-   (fn
-     ([request]
-      (wary-async/then (verified request key-fn opts)
-                       #(or (refusal-of % opts) (handler %))))
-     ([request respond raise]
-      (wary-async/then (async/attempt #(verified request key-fn opts))
-                       (fn [{:keys [value error]}]
-                         (cond
-                           error                      (raise error)
-                           (refusal-of value opts)    (respond (refusal-of value opts))
-                           :else                      (handler value respond raise))))))))
+   (let [opts (merge default-options opts)]
+     (fn
+       ([request]
+        (wary-async/then (verified request key-fn opts)
+                         #(or (refusal-of % opts) (handler %))))
+       ([request respond raise]
+        (wary-async/then (async/attempt #(verified request key-fn opts))
+                         (fn [{:keys [value error]}]
+                           (if error
+                             (raise error)
+                             (if-let [refused (refusal-of value opts)]
+                               (respond refused)
+                               (handler value respond raise))))))))))
 
 (comment
   (def k
