@@ -558,8 +558,10 @@ itself:
 The keys that podcast-clj puts in its requests (e.g. `::comments/for`) pass
 through. Its requests to Nostr relays go out unsigned. A Mastodon server
 fetches the keyid's actor to check the signature, so the podcast server has
-to publish that actor where anyone can read it without a signature.
-Publishing it is podcast-clj's job. Signed reads only make sense on a
+to publish that actor where anyone can read it without a signature. Mastodon
+and GoToSocial also look up an actor they don't know with WebFinger, so the
+server has to answer that too, with a self link that leads to the actor.
+Publishing both is podcast-clj's job. Signed reads only make sense on a
 server anyway, since a page can't read Mastodon's ActivityPub documents.
 
 ### A wary-fetch sender for webhooks

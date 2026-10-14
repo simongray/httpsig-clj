@@ -170,7 +170,9 @@ This order works without remembering which server accepts which
 signature. Trying RFC 9421 first would fail silently with Misskey and
 Sharkey, which answer a bad signature with a stripped-down actor and a
 200. A server checks a signature by fetching the actor of its keyid, so
-publish that actor where anyone can read it without a signature.
+publish that actor where anyone can read it without a signature. Mastodon
+and GoToSocial also look up an actor they don't know with WebFinger, so
+serve a WebFinger response whose self link leads to the actor.
 
 Ring
 ----
