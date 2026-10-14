@@ -265,7 +265,11 @@ node test/browser-run.mjs target/browser-test  # run in a headless Chrome
 
 The fetch script downloads the test suite of structured fields at a pinned
 commit into `dev-resources/`, which Git ignores. The examples of RFC 9421
-and of draft-cavage are in the tests.
+and of draft-cavage are in the tests. Other libraries of RFC 9421 check
+this one too, with random requests: each verifies what the other signs,
+[Visma's](https://github.com/Visma-AutoPay/http-signatures) on the JVM and
+[dhensby's](https://github.com/dhensby/node-http-message-signatures) in
+Node.
 
 The public namespaces are the root, `cavage`, `ring`, `digest` and `sfv`.
 The internal ones are under `impl`:
