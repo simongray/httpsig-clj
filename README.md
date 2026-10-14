@@ -43,7 +43,7 @@ release from [Clojars](https://clojars.org/dk.simongray/httpsig-clj) to the
 `:deps` of your `deps.edn`:
 
 ```clojure
-dk.simongray/httpsig-clj {:mvn/version "0.1.0"}
+dk.simongray/httpsig-clj {:mvn/version "0.1.1"}
 ```
 
 For changes that aren't released yet, use the SHA of the latest commit on
