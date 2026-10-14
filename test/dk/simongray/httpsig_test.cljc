@@ -294,6 +294,36 @@
      #(support/then (support/outcome (fn [] (httpsig/sign delivery k {:nonce "a\nb"})))
                     (fn [{:keys [error]}] (is (= :dk.simongray.httpsig.sfv/invalid error)))))))
 
+;; RFC 9421, section 7.3.3: a response that covers nothing of its request
+;; can stand as the answer to any other
+(deftest responses-to-requests
+  (let [k        (get examples/jwk-keys "test-shared-secret")
+        request  {:method :get :url "https://example.com/balance"}
+        response {:status 200 :body "{\"balance\": 100}"}
+        bound    ["@status" ["@method" {"req" true}] ["@target-uri" {"req" true}] "content-digest"]]
+    (support/run
+     (fn []
+       (support/then
+        (httpsig/sign response k {:request request})
+        (fn [signed]
+          (is (= bound (:components (first (httpsig/signatures signed)))))
+          (support/all
+           [(support/then (httpsig/verify signed (constantly k) {:request request})
+                          #(is (= "sig1" (:label %)) (str (:error %))))
+            (support/then (httpsig/verify signed (constantly k)
+                                          {:request (assoc request :url "https://example.com/other")})
+                          #(is (= ::httpsig/invalid-signature (:error %)) "the answer to another request"))]))))
+     (fn []
+       (support/then
+        (httpsig/sign response k)
+        (fn [signed]
+          (support/all
+           [(support/then (httpsig/verify signed (constantly k))
+                          #(is (= "sig1" (:label %)) "without a request to tie it to"))
+            (support/then (httpsig/verify signed (constantly k) {:request request})
+                          #(is (= {:error ::httpsig/not-covered :component ["@method" {"req" true}]}
+                                  (select-keys % [:error :component]))))])))))))
+
 (deftest results-show-no-private-keys
   (let [request {:method :get :url "https://example.com/"}]
     (support/run

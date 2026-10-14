@@ -95,7 +95,9 @@ Without an `:alg`, the algorithm follows from the kind of key, e.g.
 rsa-v1_5-sha256 for RSA as in Mastodon.
 
 By default the signature of a request covers its method and URL, and that
-of a response its status. Both cover a digest of the body when there is
+of a response its status. Given the `:request` that it answers, a
+response covers the request's method and URL too, so that it can't stand
+as the answer to another. Both cover a digest of the body when there is
 one. Give `:components` to cover more, e.g. `["@method" "@target-uri"
 "content-type" "content-digest"]`. The docstring of `httpsig/sign` has the
 other options.

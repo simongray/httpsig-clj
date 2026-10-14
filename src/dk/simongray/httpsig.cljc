@@ -62,12 +62,24 @@
    :min-rsa-bits     2048
    :algorithms       algorithms})
 
+(defn- of-request
+  "The component `component-name` of the request of a response, with the
+  req parameter."
+  [component-name]
+  [component-name {"req" true}])
+
+;; RFC 9421, section 7.3.3: a response that covers nothing of its request
+;; can stand as the answer to any other
 (defn- default-components
   "The components that a signature of the `message` covers unless the
-  options give others: @method and @target-uri of a request, or @status of
-  a response, and content-digest when it has a body."
-  [message]
-  (cond-> (if (components/response? message) ["@status"] ["@method" "@target-uri"])
+  `opts` give others: @method and @target-uri of a request, or @status of
+  a response, and those of its request when the :request of `opts` has
+  it. Both cover content-digest when the message has a body."
+  [message opts]
+  (cond-> (cond
+            (not (components/response? message)) ["@method" "@target-uri"]
+            (:request opts)                       ["@status" (of-request "@method") (of-request "@target-uri")]
+            :else                                 ["@status"])
     (some? (:body message)) (conj "content-digest")))
 
 (defn- covers?
@@ -133,11 +145,13 @@
   (or in ClojureScript a promise of it).
 
   Unless :components says otherwise, the signature of a request covers
-  @method and @target-uri, and that of a response @status. Both cover
-  content-digest when the message has a body. sign adds a Content-Digest
-  when it covers one and the message has none. It also rewrites the URL of
-  a request as each platform's client sends it, so that @target-uri is the
-  URL on the wire.
+  @method and @target-uri, and that of a response @status. Given its
+  :request, a response also covers the @method and @target-uri of the
+  request with the req parameter, so that it can't stand as the answer to
+  another. Both cover content-digest when the message has a body. sign
+  adds a Content-Digest when it covers one and the message has none. It
+  also rewrites the URL of a request as each platform's client sends it,
+  so that @target-uri is the URL on the wire.
 
   The `opts` are these:
 
@@ -164,7 +178,7 @@
       (let [opts    (merge default-options opts)
             message (components/with-legal-url message)
             ids     (mapv components/identifier
-                          (or (:components opts) (default-components message)))
+                          (or (:components opts) (default-components message opts)))
             message (with-covered-digest message ids)]
         (wary-async/then
          (keys/signing-key key)
@@ -263,27 +277,32 @@
   The :required-components of `opts` are those that it requires. By
   default a request covers @method and its whole URL: @target-uri, or
   @authority with @request-target or with both @path and @query. A
-  response covers @status. Both cover content-digest when the message has
-  a body."
+  response covers @status, and given the :request of `opts`, the same of
+  its request with the req parameter. Both cover content-digest when the
+  message has a body."
   [message ids opts]
   (let [covered   (set (map components/same-identifier ids))
         has?      #(contains? covered (components/same-identifier (components/identifier %)))
-        response? (components/response? message)]
+        response? (components/response? message)
+        ;; the components of the request: its own, or with req in a response
+        of        (if response? of-request identity)
+        request?  (or (not response?) (some? (:request opts)))]
     (if-let [required (:required-components opts)]
       (first (remove has? required))
       (cond
         (and response? (not (has? "@status")))
         "@status"
 
-        (and (not response?) (not (has? "@method")))
-        "@method"
+        (and request? (not (has? (of "@method"))))
+        (of "@method")
 
         ;; @path alone would leave the query to anyone who changes it
-        (and (not response?)
-             (not (has? "@target-uri"))
-             (not (and (has? "@authority")
-                       (or (has? "@request-target") (and (has? "@path") (has? "@query"))))))
-        "@target-uri"
+        (and request?
+             (not (has? (of "@target-uri")))
+             (not (and (has? (of "@authority"))
+                       (or (has? (of "@request-target"))
+                           (and (has? (of "@path")) (has? (of "@query")))))))
+        (of "@target-uri")
 
         (and (message/has-body? message) (not (has? "content-digest")))
         "content-digest"))))
@@ -473,8 +492,9 @@
   - :required-components, the components that a signature has to cover,
     in place of the default policy: a request covers @method and its
     whole URL, as @target-uri, or as @authority with @request-target or
-    with both @path and @query. A response covers its @status. Both cover
-    content-digest when the message has a body.
+    with both @path and @query. A response covers its @status, and given
+    its :request, the same of the request with the req parameter. Both
+    cover content-digest when the message has a body.
   - :request, the request of a response, for components with req
   - :field-types, as sign takes them
   - :now-fn, a function that returns the time now
