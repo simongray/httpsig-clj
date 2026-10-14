@@ -1,0 +1,246 @@
+(ns ^:no-doc dk.simongray.httpsig.impl.keys
+  "The keys of signatures: the algorithms of RFC 9421 in webcrypto-clj's
+  terms, and the import of a key map's material for signing or verifying.
+
+  A key map has a :keyid, an :alg and its material: a :pem, a :jwk, a
+  :secret or a :key of webcrypto-clj. The functions that import return a
+  map of the :alg and the :key that they imported (or in ClojureScript a
+  promise of it). They throw ::httpsig/invalid-key for material that
+  doesn't import, and ::httpsig/unsupported-algorithm for an algorithm that
+  the library or the platform lacks."
+  (:require [dk.simongray.httpsig :as-alias httpsig]
+            [dk.simongray.httpsig.impl.async :as async]
+            [dk.simongray.wary-fetch.async :as wary-async]
+            [dk.simongray.wary-fetch.secret :as secret]
+            [dk.simongray.webcrypto :as webcrypto]
+            [dk.simongray.webcrypto.bytes :as bytes]
+            [dk.simongray.webcrypto.pem :as pem]))
+
+(def rsa-generation
+  "The parameters of a new RSA key of 2048 bits, but for its hash."
+  {:modulus-length 2048 :public-exponent (bytes/of [1 0 1])})
+
+;; RFC 9421, sections 3.3.1 to 3.3.6
+(def algorithms
+  "The algorithms of RFC 9421's registry, by name, as webcrypto-clj takes
+  them: the algorithm to :import a key for, to :sign and verify with, and
+  to :generate a key by."
+  {"rsa-pss-sha512"    {:import   {:name :rsa-pss :hash :sha-512}
+                        :sign     {:name :rsa-pss :salt-length 64}
+                        :generate (merge {:name :rsa-pss :hash :sha-512} rsa-generation)}
+   "rsa-v1_5-sha256"   {:import   {:name :rsassa-pkcs1-v1_5 :hash :sha-256}
+                        :sign     :rsassa-pkcs1-v1_5
+                        :generate (merge {:name :rsassa-pkcs1-v1_5 :hash :sha-256} rsa-generation)}
+   "hmac-sha256"       {:import   {:name :hmac :hash :sha-256}
+                        :sign     :hmac
+                        :generate {:name :hmac :hash :sha-256}}
+   "ecdsa-p256-sha256" {:import   {:name :ecdsa :named-curve :p-256}
+                        :sign     {:name :ecdsa :hash :sha-256}
+                        :generate {:name :ecdsa :named-curve :p-256}}
+   "ecdsa-p384-sha384" {:import   {:name :ecdsa :named-curve :p-384}
+                        :sign     {:name :ecdsa :hash :sha-384}
+                        :generate {:name :ecdsa :named-curve :p-384}}
+   "ed25519"           {:import   :ed25519
+                        :sign     :ed25519
+                        :generate :ed25519}})
+
+(defn invalid-key
+  "The exception of a key that doesn't import, for the reason `why`."
+  ([why]
+   (invalid-key why nil))
+  ([why cause]
+   (ex-info why {:type ::httpsig/invalid-key} cause)))
+
+(defn unsupported
+  "The exception of the algorithm `alg` that the library or the platform
+  lacks, for the reason `why`."
+  [alg why]
+  (ex-info why {:type ::httpsig/unsupported-algorithm :alg alg}))
+
+(defn check-algorithm
+  "The algorithm `alg`, or a throw when it isn't one of RFC 9421's."
+  [alg]
+  (if (contains? algorithms alg)
+    alg
+    (throw (unsupported alg (str "The algorithms of RFC 9421 are " (pr-str (sort (keys algorithms)))
+                                 ", not " (pr-str alg))))))
+
+;; TODO: take the kind of a PEM key from webcrypto-clj's pem/key-data once
+;; it says, rather than try to import the key for each algorithm in turn
+(def inferred-algorithms
+  "The algorithms that a key in PEM without an :alg can be for, tried in
+  turn. An RSA key is rsa-v1_5-sha256, as Mastodon takes it."
+  ["rsa-v1_5-sha256" "ecdsa-p256-sha256" "ecdsa-p384-sha384" "ed25519"])
+
+(defn jwk-algorithm
+  "The algorithm of the JWK `jwk` by its key type, or nil."
+  [{:keys [kty crv] :as jwk}]
+  (case kty
+    "RSA" "rsa-v1_5-sha256"
+    "EC"  (case crv "P-256" "ecdsa-p256-sha256" "P-384" "ecdsa-p384-sha384" nil)
+    "OKP" (when (= "Ed25519" crv) "ed25519")
+    "oct" "hmac-sha256"
+    nil))
+
+(defn crypto-key-algorithm
+  "The algorithm of RFC 9421 that the key `k` of webcrypto-clj is for, or
+  nil."
+  [k]
+  (let [{:keys [name hash named-curve]} (:algorithm (webcrypto/key-info k))]
+    (case name
+      :rsassa-pkcs1-v1_5 (when (= :sha-256 hash) "rsa-v1_5-sha256")
+      :rsa-pss           (when (= :sha-512 hash) "rsa-pss-sha512")
+      :hmac              (when (= :sha-256 hash) "hmac-sha256")
+      :ecdsa             (case named-curve :p-256 "ecdsa-p256-sha256" :p-384 "ecdsa-p384-sha384" nil)
+      :ed25519           "ed25519"
+      nil)))
+
+(defn jwk-of
+  "The JWK `jwk` with its members as keywords, and without the members that
+  limit its use, which the library decides."
+  [jwk]
+  (-> (update-keys jwk keyword)
+      (dissoc :key_ops :use :ext)))
+
+;; RFC 7518, section 6
+(defn public-jwk
+  "The JWK `jwk` without the members of a private key."
+  [{:keys [kty] :as jwk}]
+  (cond-> jwk
+    (not= "oct" kty) (dissoc :d :p :q :dp :dq :qi :oth)))
+
+(defn secret-bytes
+  "The bytes of the shared secret `s`: bytes, or text as UTF-8, hidden or
+  not."
+  [s]
+  (let [s (secret/reveal s)]
+    (if (string? s) (bytes/encode s) s)))
+
+(defn pem-material
+  "The key in the PEM text `s` as the :format and :data that import-key
+  takes."
+  [s]
+  (let [{:keys [value error]} (try {:value (pem/key-data (secret/reveal s))}
+                                   (catch #?(:clj Exception :cljs :default) e
+                                     {:error e}))]
+    (or value (throw (invalid-key "The PEM holds no key that the library reads" error)))))
+
+(defn translated
+  "The exception of webcrypto-clj `e` of an import for the algorithm `alg`,
+  as one of the library's own."
+  [e alg]
+  (if (= :dk.simongray.webcrypto/not-supported-error (async/error-type e))
+    (unsupported alg (str "The platform lacks " alg ": " (ex-message e)))
+    (invalid-key (str "The key isn't one of " alg ": " (ex-message e)) e)))
+
+(defn imported
+  "The key of the `material` for the algorithm `alg`, with the `usages`, as
+  a map of the :alg and the :key, which is `extractable` (or not)."
+  ([material alg usages]
+   (imported material alg usages false))
+  ([{:keys [format data]} alg usages extractable]
+   (wary-async/then (async/attempt #(webcrypto/import-key format data (:import (get algorithms alg))
+                                                          extractable usages))
+                    (fn [{:keys [value error]}]
+                      (if error
+                        (throw (translated error alg))
+                        {:alg alg :key value})))))
+
+(defn first-imported
+  "The key of the `material` for the first of the algorithms `algs` that it
+  imports for, as imported gives it, or the error of the last."
+  [material algs usages extractable]
+  (let [[alg & more] algs]
+    (wary-async/then (async/attempt #(imported material alg usages extractable))
+                     (fn [{:keys [value error]}]
+                       (cond
+                         value      value
+                         (seq more) (first-imported material more usages extractable)
+                         :else      (throw error))))))
+
+(defn candidates
+  "The algorithms that the key map `key` can be for: its :alg, or else those
+  of its material."
+  [{:keys [alg jwk secret]}]
+  (cond
+    alg    [(check-algorithm alg)]
+    secret ["hmac-sha256"]
+    jwk    [(or (jwk-algorithm (jwk-of jwk))
+                (throw (invalid-key "The JWK is of no algorithm of RFC 9421")))]
+    :else  inferred-algorithms))
+
+(defn material
+  "The material of the key map `key` as the :format and :data that
+  import-key takes, its public part when `public?`."
+  [{:keys [pem public-pem jwk secret]} public?]
+  (cond
+    secret               {:format :raw :data (secret-bytes secret)}
+    jwk                  {:format :jwk :data (cond-> (jwk-of jwk) public? public-jwk)}
+    (and public? public-pem) (pem-material public-pem)
+    pem                  (pem-material pem)
+    :else                (throw (invalid-key "A key has its :pem, :jwk, :secret or :key"))))
+
+(defn given-key
+  "The :key of webcrypto-clj of the key map `key` as a map of its :alg and
+  the :key."
+  [{k :key alg :alg}]
+  {:alg (or (some-> alg check-algorithm)
+            (crypto-key-algorithm k)
+            (throw (invalid-key "The key is for no algorithm of RFC 9421")))
+   :key k})
+
+(defn signing-key
+  "The key of the key map `key` to sign with."
+  [key]
+  (async/promised
+   #(if (:key key)
+      (given-key key)
+      (first-imported (material key false) (candidates key) [:sign] false))))
+
+(defn public-of
+  "The public key of the private key `imported`, as a map of its :alg and
+  its :key, from its JWK."
+  [{:keys [alg key]}]
+  (wary-async/then (webcrypto/export-key :jwk key)
+                   #(imported {:format :jwk :data (public-jwk (jwk-of %))} alg [:verify])))
+
+(defn verifying-key
+  "The key of the key map `key` to verify with: the public key of a key
+  pair, which a private key in PEM gives too."
+  [key]
+  (async/promised
+   (fn []
+     (let [{:keys [format] :as m} (when-not (:key key) (material key true))]
+       (cond
+         (:key key)        (given-key key)
+         (= :pkcs8 format) (wary-async/then (first-imported m (candidates key) [:sign] true)
+                                            public-of)
+         :else             (first-imported m (candidates key) [:verify] false))))))
+
+(defn modulus-bits
+  "The bits of the modulus of the RSA key `k` of webcrypto-clj, or nil for
+  a key of another kind."
+  [k]
+  (get-in (webcrypto/key-info k) [:algorithm :modulus-length]))
+
+;; PEM labels, RFC 7468, section 10 and 11
+(defn generate-key
+  "A new key map of the algorithm `alg` with the `keyid`: for HMAC its
+  :secret, and else its :pem and :public-pem. The secret and the private
+  key are hidden texts."
+  [alg keyid]
+  (let [{:keys [generate]} (get algorithms (check-algorithm alg))]
+    (wary-async/then
+     (webcrypto/generate-key generate true [:sign :verify])
+     (fn [generated]
+       (if (= "hmac-sha256" alg)
+         (wary-async/then (webcrypto/export-key :raw generated)
+                          #(hash-map :keyid keyid :alg alg :secret (secret/hide %)))
+         (wary-async/then
+          (wary-async/all [(webcrypto/export-key :pkcs8 (:private-key generated))
+                           (webcrypto/export-key :spki (:public-key generated))])
+          (fn [[private public]]
+            {:keyid      keyid
+             :alg        alg
+             :pem        (secret/hide (pem/encode "PRIVATE KEY" private))
+             :public-pem (pem/encode "PUBLIC KEY" public)})))))))
