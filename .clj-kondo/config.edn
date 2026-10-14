@@ -1,0 +1,5 @@
+{:linters      {:missing-docstring {:level :warning}
+                :unused-binding    {:exclude-destructured-as true}}
+ ;; tests and the data of examples need no docstrings
+ :ns-groups    [{:pattern "dk\\.simongray\\.httpsig.*-(test|examples)" :name tests}]
+ :config-in-ns {tests {:linters {:missing-docstring {:level :off}}}}}
