@@ -58,19 +58,20 @@
   [t]
   (quot (inst-ms t) 1000))
 
-(defn- request-target
-  "The value of (request-target) of the `message`: its method in lower case
-  and its path, with the query when `query?`."
-  [message query?]
-  (let [u (url/parse (str (:url message)))]
-    (str (str/lower-case (components/method-name message)) " " (url/pathname u)
-         (when (and query? (some? (:query u))) (str "?" (:query u))))))
-
 (defn- missing
   "The exception of the header `header-name` that the message lacks."
   [header-name]
   (ex-info (str "The message has no " header-name)
            {:type ::httpsig/missing-component :component header-name}))
+
+(defn- request-target
+  "The value of (request-target) of the `message`: its method in lower case
+  and its path, with the query when `query?`."
+  [message query?]
+  (let [u (or (some-> (:url message) str url/parse)
+              (throw (missing "(request-target)")))]
+    (str (str/lower-case (components/method-name message)) " " (url/pathname u)
+         (when (and query? (some? (:query u))) (str "?" (:query u))))))
 
 ;; draft-cavage-http-signatures-12, section 2.3
 (defn- header-value
@@ -149,12 +150,18 @@
     (request-target), (created) and (expires)
   - :created and :expires, insts for (created) and (expires), the time now
     by default for created
-  - :now-fn, a function that gives the time now"
+  - :now-fn, a function that gives the time now
+
+  It throws ::httpsig/invalid-key for a keyid with a quote, a backslash
+  or a line break, which the draft can't write."
   ([message key]
    (sign message key {}))
   ([message key opts]
    (async/promised
     (fn []
+      ;; the draft writes the keyId in quotes, without escapes
+      (when (re-find #"[\"\\\r\n]" (str (:keyid key)))
+        (throw (keys/invalid-key "A keyId has no quotes, backslashes or line breaks")))
       (let [opts    (merge default-options opts)
             message (components/with-legal-url message)
             headers (mapv str/lower-case (or (:signed-headers opts) (signed-headers message)))
@@ -179,17 +186,52 @@
                                  (signature-field key (algorithm-name alg headers opts)
                                                   headers params %))))))))))
 
-(def param-pattern
-  "A parameter of a Signature field: a name, and a value in quotes or bare,
-  before a comma or the end."
-  #"\s*([A-Za-z]+)\s*=\s*(?:\"([^\"]*)\"|([^\s,\"]*))\s*(?:,|$)")
+(defn- tchars-end
+  "The index after the tchars of HTTP from `i` in the text `s`."
+  [s i]
+  (if (sfv/tchar? (sfv/code-at s i))
+    (recur s (inc i))
+    i))
+
+(defn- read-value
+  "The value of a parameter at `i` in the text `s`, a token or a quoted
+  string, and the index after it."
+  [s i]
+  (if (= 0x22 (sfv/code-at s i))
+    (sfv/parse-string s i)
+    (let [end (tchars-end s i)]
+      (when (= i end)
+        (throw (sfv/invalid "A parameter has a value")))
+      [(subs s i end) end])))
+
+;; draft-cavage-http-signatures-12, section 4.1, as Mastodon's parser reads
+;; it: parameters apart by commas, each a token, = and a token or a quoted
+;; string. A loop rather than a regex, which would backtrack through a long
+;; run of letters at each of them.
+(defn- read-params
+  "The parameters of the Signature field `s` as pairs of names and values,
+  or a throw when they don't parse."
+  [s]
+  (loop [i     (sfv/skip s 0 sfv/ows)
+         pairs []]
+    (let [name-end    (tchars-end s i)
+          _           (when (= i name-end)
+                        (throw (sfv/invalid "A parameter has a name")))
+          equals      (sfv/expect s (sfv/skip s name-end sfv/ows) 0x3D "A parameter's name goes before =")
+          [value end] (read-value s (sfv/skip s equals sfv/ows))
+          pairs       (conj pairs [(subs s i name-end) value])
+          after       (sfv/skip s end sfv/ows)]
+      (cond
+        (= -1 (sfv/code-at s after))   pairs
+        (= 0x2C (sfv/code-at s after)) (recur (sfv/skip s (inc after) sfv/ows) pairs)
+        :else                          (throw (sfv/invalid "Parameters are apart by commas"))))))
 
 (defn- seconds-of
   "The whole seconds of the text `s` of a timestamp, or nil when it isn't
   one. The draft allows a decimal in expires."
   [s]
-  (when (and s (re-matches #"-?\d+(\.\d+)?" s))
-    (long #?(:clj (Double/parseDouble s) :cljs (js/parseFloat s)))))
+  (when (and s (re-matches #"-?\d{1,15}(\.\d+)?" s))
+    (long (parse-double s))))
 
 ;; draft-cavage-http-signatures-12, sections 2.1 and 2.2
 (defn- read-signature
@@ -198,23 +240,27 @@
   :error when it's malformed.
 
   As Mastodon does, it takes a Signature prefix that old libraries of Node
-  wrote, and refuses a parameter given twice."
+  wrote, and refuses a parameter given twice. It refuses a header signed
+  twice too, which no signer needs."
   [s]
-  (let [pairs  (re-seq param-pattern (str/replace s #"^\s*Signature\s+" ""))
-        names  (map second pairs)
-        values (into {} (for [[_ k quoted bare] pairs] [k (or quoted bare)]))
+  (let [pairs  (try (read-params (str/replace s #"^\s*Signature\s+" ""))
+                    (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) _
+                      nil))
+        names  (map first pairs)
+        values (into {} pairs)
         alg    (get values "algorithm")
         heads  (if-let [h (get values "headers")]
                  (str/split (str/lower-case (str/trim h)) #"\s+")
                  ;; section 2.1.6, and date for rsa-sha256 as Mastodon has it
                  (if (or (nil? alg) (= "hs2019" alg)) ["(created)"] ["date"]))]
     (cond
-      (or (empty? pairs) (not= (count names) (count (distinct names))))
+      (or (nil? pairs) (not= (count names) (count (distinct names))))
       {:error ::httpsig/malformed}
 
       (or (nil? (get values "keyId"))
           (nil? (some-> (get values "signature") bytes/from-base64))
-          (= [""] heads))
+          (= [""] heads)
+          (not= (count heads) (count (distinct heads))))
       {:error ::httpsig/malformed :keyid (get values "keyId")}
 
       :else
@@ -230,18 +276,20 @@
   `message` over the `headers` to cover, and that it doesn't, or nil.
 
   The :required-headers of `opts` are those that it requires. By default
-  they're Mastodon's: date or (created), (request-target) or digest, host
-  for a GET and digest for a POST."
+  they're Mastodon's, and a little more: date or (created), and
+  (request-target) or digest. Every method but POST needs host, where
+  Mastodon asks it of a GET, and a message with a body needs digest,
+  where Mastodon asks it of a POST."
   [message headers opts]
   (let [covers? #(some #{%} headers)
-        method  (components/method-name message)]
+        method  (str/upper-case (components/method-name message))]
     (if-let [required (:required-headers opts)]
       (first (remove covers? (map str/lower-case required)))
       (cond
-        (not (or (covers? "date") (covers? "(created)")))             "date"
-        (not (or (covers? "(request-target)") (covers? "digest")))    "(request-target)"
-        (and (= "GET" method) (not (covers? "host")))                 "host"
-        (and (= "POST" method) (not (covers? "digest")))              "digest"))))
+        (not (or (covers? "date") (covers? "(created)")))          "date"
+        (not (or (covers? "(request-target)") (covers? "digest"))) "(request-target)"
+        (and (not= "POST" method) (not (covers? "host")))         "host"
+        (and (message/has-body? message) (not (covers? "digest"))) "digest"))))
 
 (defn- freshness-error
   "The :error of a signature over the `headers` of the `message`, with its
@@ -302,11 +350,13 @@
 
 (defn- verifies?
   "Whether the `signature` of the `message` verifies with the key
-  `verifier` over the signing string with or without the query of the URL,
-  since Mobilizon and Pleroma sign the path alone (in ClojureScript a
-  promise of it)."
+  `verifier` over the signing string (in ClojureScript a promise of it).
+  For a GET or a HEAD, that can be without the query of the URL, since
+  Mobilizon and Pleroma sign the path alone. A method that changes
+  something has its query signed."
   [message {:keys [headers created expires signature]} {:keys [alg key]} opts]
   (let [params  {:created created :expires expires}
+        reads?  (contains? #{"GET" "HEAD"} (str/upper-case (components/method-name message)))
         attempt (fn [query?]
                   (wary-async/then
                    (async/attempt #(webcrypto/verify (:sign (get keys/algorithms alg)) key signature
@@ -315,7 +365,7 @@
                    #(true? (:value %))))]
     (wary-async/then (attempt true)
                      (fn [verified]
-                       (if (or verified (not (some #{"(request-target)"} headers)))
+                       (if (or verified (not reads?) (not (some #{"(request-target)"} headers)))
                          verified
                          (attempt false))))))
 
@@ -343,7 +393,7 @@
                             #(if %
                                (cond-> {:keyid      (:keyid signature)
                                         :alg        (:alg verifier)
-                                        :key        key
+                                        :key        (keys/shown key)
                                         :components (:headers signature)}
                                  (:created signature) (assoc :created (sfv/instant (:created signature)))
                                  (:expires signature) (assoc :expires (sfv/instant (:expires signature))))
@@ -365,8 +415,8 @@
   the signed headers, and the errors are the same. The verifier takes:
 
   - rsa-sha256, hs2019 or no algorithm at all
-  - (request-target) with or without the query, since Mobilizon and
-    Pleroma sign the path alone
+  - for a GET or a HEAD, (request-target) with or without the query, since
+    Mobilizon and Pleroma sign the path alone
   - (created) and (expires), and a Signature prefix as old libraries of
     Node wrote it
   - a Digest whose SHA-256 or SHA-512 matches the body, when it's signed
@@ -375,8 +425,8 @@
   these:
 
   - :required-headers, the headers that a signature has to cover, in place
-    of Mastodon's: date or (created), (request-target) or digest, host for
-    a GET and digest for a POST
+    of the default: date or (created), (request-target) or digest, host
+    for any method but POST, and digest for a message with a body
   - :now-fn, a function that gives the time now
 
   The signature's time is its (created) when it covers one, and else its

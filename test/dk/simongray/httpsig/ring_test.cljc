@@ -74,8 +74,26 @@
           (support/then (ring/verified (ring-request signed) (constantly actor-key) (assoc opts :max-bytes 5))
                         (fn [request]
                           (is (= ::httpsig/too-large (:error (::httpsig/signature request))))))]))))
-   #(support/then (ring/verified (ring-request delivery) (constantly actor-key) opts)
-                  (fn [request] (is (not (contains? request ::httpsig/signature)) "unsigned")))))
+   #(support/then (ring/verified (assoc (ring-request delivery) :body :unread) (constantly actor-key) opts)
+                  (fn [request]
+                    (is (not (contains? request ::httpsig/signature)) "unsigned")
+                    (is (= :unread (:body request)) "an unsigned request keeps its body unread")))))
+
+;; RFC 9110, section 7.2: a Host with a path in it would move the path of
+;; the URL that a signature covers
+(deftest forged-host
+  (support/run
+   (fn []
+     (support/then
+      (httpsig/sign (assoc delivery :url "https://example.com/users/ann/inbox") actor-key)
+      (fn [signed]
+        (let [request (-> (ring-request (assoc signed :url "https://example.com/inbox"))
+                          (assoc :scheme :https)
+                          (assoc-in [:headers "host"] "example.com/users/ann"))]
+          (support/then (ring/verified request (constantly actor-key))
+                        (fn [request]
+                          (is (= ::httpsig/missing-component (:error (::httpsig/signature request)))
+                              "a URL of no Host rather than the signed one")))))))))
 
 (def rsa-key
   (get examples/pem-keys "test-key-rsa"))

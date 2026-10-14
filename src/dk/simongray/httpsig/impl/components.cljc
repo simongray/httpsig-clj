@@ -144,7 +144,7 @@
   "The URL of the request `message`, parsed, or a throw for the component
   `id` when it has none."
   [message id]
-  (or (some-> (:url message) str url/parse)
+  (or (::url message)
       (throw (missing id "The request has no URL"))))
 
 (defn method-name
@@ -163,17 +163,24 @@
   of its own, which percent-encodes a space."
   (fn [c] (percent/form-urlencoded-set c)))
 
+(defn query-pairs
+  "The parameters of the query of the parsed URL `u` by their names, as
+  pairs of names and values, all encoded as @query-param has them."
+  [u]
+  (let [encode #(percent/encode % query-param-set)]
+    (group-by first (for [[k v] (params/parse (or (:query u) ""))]
+                      [(encode k) (encode v)]))))
+
 (defn query-param
   "The value of the query parameter of the component `id` in the request
   `message`, encoded."
   [message id]
-  (let [encode  #(percent/encode % query-param-set)
-        wanted  (parameter id "name")
-        matches (filter #(= wanted (encode (first %)))
-                        (params/parse (or (:query (parsed-url message id)) "")))]
+  (parsed-url message id)
+  (let [wanted  (parameter id "name")
+        matches (get (::query message) wanted)]
     (case (count matches)
       0 (throw (missing id (str "The query has no parameter " wanted)))
-      1 (encode (second (first matches)))
+      1 (second (first matches))
       (throw (malformed id (str "The query has the parameter " wanted " more than once"))))))
 
 ;; RFC 9421, section 2.2
@@ -196,46 +203,95 @@
     "@query-param"    (query-param message id)
     "@status"         (str (:status message))))
 
-;; RFC 9421, section 2.1: leading and trailing whitespace stripped, and
-;; obsolete line folding replaced by a space
-(defn canonical-line
-  "The field line `s` without whitespace around it or line folding in it."
+(defn- trim-start
+  "The text `s` without the spaces and tabs at its start."
   [s]
-  (str/replace (str/trim s) #"\s*\r?\n[ \t]+" " "))
+  (subs s (sfv/skip s 0 sfv/ows)))
 
-(defn structured-value
-  "The value of the field `id` of the type `type` whose `lines` are given,
-  parsed, or a throw when it doesn't parse."
-  [id type lines]
-  (let [v (sfv/parse type (str/join ", " lines))]
-    (when (nil? v)
-      (throw (missing id (str "The field " (first id) " isn't a structured field of its type"))))
-    v))
+(defn- trim-end
+  "The text `s` without the spaces and tabs at its end."
+  [s]
+  (loop [end (count s)]
+    (if (and (pos? end) (contains? sfv/ows (sfv/code-at s (dec end))))
+      (recur (dec end))
+      (subs s 0 end))))
+
+;; RFC 9421, section 2.1: leading and trailing whitespace stripped, and
+;; obsolete line folding (RFC 9112, section 5.2: OWS CRLF RWS) replaced by
+;; a space. A loop rather than a regex, which would backtrack through a
+;; long run of spaces at each of its characters.
+(defn canonical-line
+  "The field line `s` without spaces and tabs around it, and with each
+  obsolete line folding in it replaced by a space."
+  [s]
+  (trim-end
+   (trim-start
+    (if-not (str/includes? s "\n")
+      s
+      (let [lines (str/split s #"\r?\n" -1)
+            n     (count lines)
+            fold? (fn [i] (and (< 0 i n) (contains? sfv/ows (sfv/code-at (nth lines i) 0))))]
+        (apply str (for [i (range n)]
+                     (str (when (pos? i) (if (fold? i) " " "\n"))
+                          (cond-> (nth lines i)
+                            (fold? i)       trim-start
+                            (fold? (inc i)) trim-end)))))))))
+
+(defn field-lines
+  "The lines of the field `field-name` of the `message` as a signature base
+  has them, or nil when it has none."
+  [message field-name]
+  (some->> (message/field-lines (:headers message) field-name)
+           (mapv canonical-line)))
+
+;; Each field is read and parsed once, however many components name it, so
+;; that the work of a signature base grows with its message and not with
+;; the components that a stranger can list, e.g. "x";key="a" "x";key="b".
+(defn prepared
+  "The `message` with its URL and the query in it parsed, and with each of
+  its fields read and parsed on first use, for the components that read
+  them."
+  [message]
+  (let [u        (some-> (:url message) str url/parse)
+        lines-of (memoize #(field-lines message %))
+        parsed   (memoize (fn [field-name type]
+                            (some->> (lines-of field-name)
+                                     (str/join ", ")
+                                     (sfv/parse type))))]
+    (cond-> (assoc message
+                   ::field-lines  lines-of
+                   ::parsed-field parsed
+                   ::members      (memoize #(some->> (parsed % :dictionary) (into {}))))
+      u (assoc ::url u ::query (query-pairs u)))))
+
+(defn- not-structured
+  "The exception of the field `id` that doesn't parse as its type."
+  [[component-name :as id]]
+  (missing id (str "The field " component-name " isn't a structured field of its type")))
 
 ;; RFC 9421, sections 2.1, 2.1.1, 2.1.2 and 2.1.3
 (defn field-value
-  "The value of the field `id` of the `message`, with the `types` of
-  structured fields for the sf parameter."
+  "The value of the field `id` of the prepared `message`, with the `types`
+  of structured fields for the sf parameter."
   [message [component-name :as id] types]
-  (let [lines (or (message/field-lines (:headers message) component-name)
+  (let [lines (or ((::field-lines message) component-name)
                   (throw (missing id (str "The message has no field " component-name))))
-        lines (map canonical-line lines)
         k     (parameter id "key")]
     (cond
       (parameter id "bs")
       (sfv/serialize-list (map bytes/encode lines))
 
       (some? k)
-      (let [member (some (fn [[mk v]] (when (= k mk) v))
-                         (structured-value id :dictionary lines))]
-        (when-not member
-          (throw (missing id (str "The field " component-name " has no member " k))))
-        (sfv/serialize-member member))
+      (let [members (or ((::members message) component-name)
+                        (throw (not-structured id)))]
+        (sfv/serialize-member (or (get members k)
+                                  (throw (missing id (str "The field " component-name " has no member " k))))))
 
       (parameter id "sf")
       (let [type (or (get types component-name)
                      (throw (missing id (str "The library doesn't know the type of the field " component-name))))]
-        (sfv/serialize type (structured-value id type lines)))
+        (sfv/serialize type (or ((::parsed-field message) component-name type)
+                                (throw (not-structured id)))))
 
       :else
       (str/join ", " lines))))
@@ -253,9 +309,9 @@
 
 ;; RFC 9421, section 2.5, step 2.5
 (defn value
-  "The value of the component `id` in the `message`, or in the :request of
-  `opts` for one with the req parameter. The :field-types of `opts` add to
-  the field-types."
+  "The value of the component `id` in the prepared `message`, or in the
+  prepared :request of `opts` for one with the req parameter. The
+  :field-types of `opts` add to the field-types."
   [message id {:keys [request] :as opts}]
   (let [context (if (parameter id "req")
                   (or request (throw (missing id "The response has no request for the req parameter")))
@@ -263,6 +319,20 @@
     (check-value id (if (str/starts-with? (first id) "@")
                       (derived-value context id)
                       (field-value context id (merge field-types (:field-types opts)))))))
+
+(defn- with-prepared-request
+  "The `opts` of value with their :request prepared."
+  [opts]
+  (cond-> opts
+    (:request opts) (update :request prepared)))
+
+(defn component-value
+  "The value of the component `id` in the `message`, by the `opts` of
+  value, or a throw when RFC 9421 doesn't allow the component."
+  [message id opts]
+  (value (prepared message)
+         (check-identifier id (response? message))
+         (with-prepared-request opts)))
 
 (defn serialize-identifier
   "The text of the component `id` in a signature base."
@@ -274,7 +344,9 @@
   "The signature base of the `components` of the `message` with the
   signature `params`, as pairs, by the `opts` of value."
   [message components params opts]
-  (let [ids (map #(check-identifier % (response? message)) components)]
+  (let [ids     (map #(check-identifier % (response? message)) components)
+        message (prepared message)
+        opts    (with-prepared-request opts)]
     (when-not (= (count ids) (count (distinct (map same-identifier ids))))
       (throw (malformed nil "A component is covered once")))
     (str (apply str (for [id ids]

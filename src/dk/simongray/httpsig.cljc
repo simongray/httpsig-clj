@@ -71,11 +71,6 @@
   [t]
   (quot (inst-ms t) 1000))
 
-(defn- has-body?
-  "Whether the `message` has a body of at least one byte."
-  [message]
-  (pos? (bytes/length (message/body-bytes (:body message)))))
-
 (defn- default-components
   "The components that a signature of the `message` covers unless the
   options give others: @method and @target-uri of a request, or @status of
@@ -263,9 +258,10 @@
   doesn't, or nil.
 
   The :required-components of `opts` are those that it requires. By
-  default a request covers @method, and @target-uri or both of @authority
-  and @path. A response covers @status, and either covers content-digest
-  when it has a body."
+  default a request covers @method and its whole URL: @target-uri, or
+  @authority with @request-target or with both @path and @query. A
+  response covers @status. Both cover content-digest when the message has
+  a body."
   [message ids opts]
   (let [covered (set (map components/same-identifier ids))
         has?    #(contains? covered (components/same-identifier (components/identifier %)))]
@@ -278,12 +274,14 @@
         (and (not (components/response? message)) (not (has? "@method")))
         "@method"
 
+        ;; @path alone would leave the query to anyone who changes it
         (and (not (components/response? message))
              (not (has? "@target-uri"))
-             (not (and (has? "@authority") (has? "@path"))))
+             (not (and (has? "@authority")
+                       (or (has? "@request-target") (and (has? "@path") (has? "@query"))))))
         "@target-uri"
 
-        (and (has-body? message) (not (has? "content-digest")))
+        (and (message/has-body? message) (not (has? "content-digest")))
         "content-digest"))))
 
 ;; RFC 9421, section 3.2.1
@@ -367,7 +365,7 @@
   [{:keys [label components params]} key {:keys [alg]}]
   (merge {:label      label
           :alg        alg
-          :key        key
+          :key        (keys/shown key)
           :components (mapv component-data components)}
          (select-keys (params-data params) [:keyid :created :expires :nonce :tag])))
 
@@ -434,8 +432,9 @@
   you don't know or trust.
 
   The result of a signature that verifies is a map of its :label, :keyid,
-  :alg, the :key that verified it, its covered :components, and its
-  :created, :expires, :nonce and :tag. One that doesn't has an :error and
+  :alg, the :key that verified it (without a private key or a secret, so
+  that a log can show it), its covered :components, and its :created,
+  :expires, :nonce and :tag. One that doesn't has an :error and
   the :label and :keyid of the signature, when it has them. The error is
   one of these:
 
@@ -459,9 +458,10 @@
   - :label, to verify the signature of this label alone
   - :tag, to verify the signatures with this tag alone
   - :required-components, the components that a signature has to cover,
-    in place of the default policy: a request covers @method, and either
-    the @target-uri or both of @authority and @path. A response covers
-    its @status, and either covers content-digest when it has a body.
+    in place of the default policy: a request covers @method and its
+    whole URL, as @target-uri, or as @authority with @request-target or
+    with both @path and @query. A response covers its @status. Both cover
+    content-digest when the message has a body.
   - :request, the request of a response, for components with req
   - :field-types, as sign takes them
   - :now-fn, a function that gives the time now
@@ -517,8 +517,7 @@
   ([message id]
    (component message id {}))
   ([message id opts]
-   (let [id (components/identifier id)]
-     (components/value message (components/check-identifier id (components/response? message)) opts))))
+   (components/component-value message (components/identifier id) opts)))
 
 ;; RFC 9421, section 5.1
 (defn accept-signature
@@ -554,8 +553,18 @@
   [request]
   (contains? #{"http" "https"} (some-> (:url request) str (str/split #":" 2) first str/lower-case)))
 
-;; RFC 9421, section 7.2.4 on signing again after a redirect, and the
-;; double knock of the fediverse: the next signer after a 400 or a 401
+;; A server that redirects elsewhere picks the URL of the next hop, so a
+;; signature for any URL that it likes, with the body of a 307 or a 308,
+;; would make the sender its signing oracle. Mastodon signs every hop, and
+;; a hop to another origin is signed here only when it reads.
+(defn- signs-hop?
+  "Whether a sender signs the `hop` of a redirect of the `request`: one to
+  the same origin, or a GET or a HEAD."
+  [request hop]
+  (or (wary-url/same-origin? (:url request) (:url hop))
+      (contains? #{"GET" "HEAD"} (str/upper-case (components/method-name hop)))))
+
+;; The double knock of the fediverse: the next signer after a 400 or a 401
 (defn sender
   "A function like wary-fetch's send! that signs each request with the
   `key` and sends it with `send`, by the `opts` below and those of sign.
@@ -571,7 +580,9 @@
 
   A signature covers the URL, so each hop of a redirect needs its own.
   The request carries a :prepare-fn that signs each hop again, which
-  wary-fetch calls before it sends the hop. A browser follows its own
+  wary-fetch calls before it sends the hop. A hop to another origin is
+  signed only when it's a GET or a HEAD, so that a server can't redirect
+  a signed POST to a URL of its choosing. A browser follows its own
   redirects, so there only the first hop has a signature."
   ([send key]
    (sender send key {}))
@@ -581,9 +592,13 @@
        (if-not (web-request? request)
          (send request)
          (letfn [(knock [[signer & more]]
-                   (let [sign-hop #(signer (unsigned %) key opts)]
+                   (let [sign-hop (fn [hop]
+                                    (let [hop (unsigned hop)]
+                                      (if (signs-hop? request hop)
+                                        (signer hop key opts)
+                                        hop)))]
                      (wary-async/then
-                      (sign-hop request)
+                      (signer (unsigned request) key opts)
                       (fn [signed]
                         (wary-async/then
                          (send (assoc signed :prepare-fn sign-hop))

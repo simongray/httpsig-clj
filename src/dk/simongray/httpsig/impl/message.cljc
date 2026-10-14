@@ -46,3 +46,8 @@
       (bytes/bytes? body) body
       :else               (throw (ex-info "The body of a message to sign or digest is text or bytes, not a stream or a collection"
                                           {:type :dk.simongray.httpsig/invalid-body})))))
+
+(defn has-body?
+  "Whether the `message` has a body of at least one byte."
+  [message]
+  (pos? (bytes/length (body-bytes (:body message)))))

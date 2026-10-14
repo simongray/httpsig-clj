@@ -3,10 +3,11 @@
   function, e.g. for a Pedestal interceptor, and as middleware.
 
   A Ring request keeps the parts of its URL under separate keys and its
-  body in a stream. So the functions here make it a message as the root
-  namespace has them, with its body read into bytes, before they verify
-  it. The request goes on to the handler with the bytes in place of the
-  stream, so the handler can read the body again."
+  body in a stream. So before they verify a signed request, the functions
+  here turn it into a message with its whole URL and its body read into
+  bytes. The request goes on to the handler with a new stream of those
+  bytes (the bytes in ClojureScript), so the handler can read the body
+  again."
   (:require [clojure.string :as str]
             [dk.simongray.httpsig :as httpsig]
             [dk.simongray.httpsig.cavage :as cavage]
@@ -42,26 +43,36 @@
     (when (and b (<= (bytes/length b) max-bytes))
       b)))
 
+;; RFC 9110, section 7.2: a Host is a host and maybe a port. A Host with a
+;; / or a ? in it would move the path of the URL that a signature covers.
+(def ^:private host-pattern
+  #"(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(?::[0-9]{1,5})?")
+
 (defn- origin
   "The origin that the client of the Ring `request` sent it to: the :origin
   of `opts`, or else its scheme and its Host (or its server's name and
-  port)."
+  port). Nil for a Host that isn't a host and a port."
   [{:keys [scheme server-name server-port] :as request} opts]
-  (or (some-> (:origin opts) (str/replace #"/+$" ""))
-      (str (name (or scheme :http)) "://"
-           (or (some-> (message/field-lines (:headers request) "host") first)
-               (str server-name (when-not (contains? #{80 443 nil} server-port)
-                                  (str ":" server-port)))))))
+  (let [scheme (str (name (or scheme :http)) "://")
+        host   (some-> (message/field-lines (:headers request) "host") first)]
+    (cond
+      (:origin opts)                 (str/replace (:origin opts) #"/+$" "")
+      (nil? host)                    (str scheme server-name
+                                          (when-not (contains? #{80 443 nil} server-port)
+                                            (str ":" server-port)))
+      (re-matches host-pattern host) (str scheme host))))
 
 (defn message
   "The Ring `request` as a message of the root namespace, with its body as
   `b`, the bytes of its body. Its URL has the :origin of `opts`, or else
-  its scheme and its Host. Behind a proxy that ends TLS, the URL that Ring
-  sees isn't the one the client signed, so give the public origin there,
-  e.g. https://example.com."
+  its scheme and its Host, and is nil when the Host isn't a host and a
+  port. Behind a proxy that ends TLS, the URL that Ring sees isn't the one
+  the client signed, so give the public origin there, e.g.
+  https://example.com."
   [{:keys [request-method uri query-string headers] :as request} b opts]
   {:method  request-method
-   :url     (str (origin request opts) uri (when query-string (str "?" query-string)))
+   :url     (some-> (origin request opts)
+                    (str uri (when query-string (str "?" query-string))))
    :headers headers
    :body    b})
 
@@ -73,38 +84,31 @@
 
 (defn verified
   "The Ring `request` with the result of verifying its signature with the
-  key that `key-fn` gives, under ::httpsig/signature, and its body read
-  into bytes (or in ClojureScript a promise of it).
+  key that `key-fn` gives, under ::httpsig/signature, and a body that the
+  handler can read again (or in ClojureScript a promise of it).
 
   The result is that of httpsig/verify, or of cavage/verify for a request
-  without a Signature-Input when :cavage?. An unsigned request has no
-  ::httpsig/signature, and one whose body has more than :max-bytes has a
-  result with the :error ::httpsig/too-large. The `opts` are those of
-  default-options, httpsig/verify and cavage/verify, and :origin, as
-  message takes it."
+  without a Signature-Input when :cavage?. A signed request whose body has
+  more than :max-bytes has a result with the :error ::httpsig/too-large.
+  An unsigned request goes on as it came, without ::httpsig/signature and
+  with its body unread. The `opts` are those of default-options,
+  httpsig/verify and cavage/verify, and :origin, as message takes it."
   ([request key-fn]
    (verified request key-fn {}))
   ([request key-fn opts]
    (async/promised
     (fn []
-      (let [opts (merge default-options opts)
-            b    (body-bytes (:body request) (:max-bytes opts))
-            m    (message request b opts)
-            has? #(some? (message/field-lines (:headers request) %))]
+      (let [opts   (merge default-options opts)
+            has?   #(some? (message/field-lines (:headers request) %))
+            verify (cond
+                     (has? "signature-input")                 httpsig/verify
+                     (and (:cavage? opts) (has? "signature")) cavage/verify)
+            b      (when verify (body-bytes (:body request) (:max-bytes opts)))]
         (cond
-          (nil? b)
-          (assoc request ::httpsig/signature {:error ::httpsig/too-large})
-
-          (has? "signature-input")
-          (wary-async/then (httpsig/verify m key-fn opts)
-                           #(assoc (with-body request b) ::httpsig/signature %))
-
-          (and (:cavage? opts) (has? "signature"))
-          (wary-async/then (cavage/verify m key-fn opts)
-                           #(assoc (with-body request b) ::httpsig/signature %))
-
-          :else
-          (with-body request b)))))))
+          (nil? verify) request
+          (nil? b)      (assoc request ::httpsig/signature {:error ::httpsig/too-large})
+          :else         (wary-async/then (verify (message request b opts) key-fn opts)
+                                         #(assoc (with-body request b) ::httpsig/signature %))))))))
 
 (defn- refusal
   "The Ring response to a request whose signature has the `error`, or none
@@ -135,10 +139,11 @@
   sees it.
 
   A request whose signature fails gets a 401, as does an unsigned request
-  when :required?. Give :accept-signature, the value of an
-  Accept-Signature field, to say what to sign. Any other request reaches
-  the handler with the result of its signature under ::httpsig/signature,
-  or without one when it's unsigned.
+  when :required?, and a signed request with a body over :max-bytes gets
+  a 413. Give :accept-signature, the value of an Accept-Signature field,
+  to say what to sign. Any other request reaches the handler with the
+  result of its signature under ::httpsig/signature, or without one when
+  it's unsigned.
 
   It has both arities of a Ring handler. In ClojureScript, where the
   verification gives a promise, use the asynchronous one, or take the

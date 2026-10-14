@@ -164,3 +164,36 @@
                   (fn [signed]
                     (support/then (error-of signed)
                                   (fn [e] (is (= ::httpsig/not-covered e) "Mastodon wants a digest of a POST")))))))
+
+;; Signature fields that no server of the fediverse sends, but a stranger
+;; can
+(deftest hostile-signatures
+  (support/run
+   (fn []
+     (support/then (cavage/sign object-get actor-key)
+                   (fn [signed]
+                     (let [field (get-in signed [:headers "Signature"])]
+                       (support/all
+                        [(support/then (error-of (with-signature signed (apply str (repeat 100000 "a"))))
+                                       #(is (= ::httpsig/malformed %) "a run of letters, which took minutes with a regex"))
+                         (support/then (error-of (with-signature signed (str/replace field "headers=\"" "headers=\"date ")))
+                                       #(is (= ::httpsig/malformed %) "a header signed twice"))
+                         (support/then (error-of (with-signature signed (str field ",created=10000000000000000000000000")))
+                                       #(is (nil? %) "a created out of range, which it doesn't sign"))])))))))
+
+;; Mastodon's policy, with host for every method but POST and a digest of
+;; any body
+(deftest policy
+  (let [error-when-signed (fn [message opts]
+                            (support/then (cavage/sign message actor-key opts) error-of))]
+    (support/run
+     #(support/then (error-when-signed (assoc inbox-post :method :put) {:signed-headers ["(request-target)" "host" "date"]})
+                    (fn [e] (is (= ::httpsig/not-covered e) "a PUT with a body needs a digest")))
+     #(support/then (error-when-signed (assoc inbox-post :method :delete :body nil) {:signed-headers ["(request-target)" "date"]})
+                    (fn [e] (is (= ::httpsig/not-covered e) "a DELETE needs host")))
+     #(support/then (error-when-signed inbox-post {:signed-headers ["(request-target)" "date" "digest"]})
+                    (fn [e] (is (nil? e) "a POST needs no host, as in Mastodon")))
+     #(support/then (error-when-signed (assoc inbox-post :url "https://blog.example/inbox?x=1") {:query? false})
+                    (fn [e] (is (= ::httpsig/invalid-signature e) "a POST has its query signed")))
+     #(support/then (support/outcome (fn [] (cavage/sign object-get (assoc actor-key :keyid "a\",headers=\"date"))))
+                    (fn [{:keys [error]}] (is (= ::httpsig/invalid-key error) "a keyId with a quote"))))))

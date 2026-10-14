@@ -56,3 +56,21 @@
      #(support/then (send {:url "wss://relay.example" :filters []})
                     (fn [{:keys [request]}]
                       (is (nil? (:headers request)) "a request to a relay goes unsigned"))))))
+
+;; A server that redirects picks the URL of the next hop, so a hop to
+;; another origin is signed only when it reads
+(deftest hops-elsewhere
+  (let [send (httpsig/sender (fn [request] {:status 200 :request request}) actor-key)]
+    (support/run
+     (fn []
+       (support/then (send {:method :post :url "https://social.example/inbox" :body "{}"})
+                     (fn [{:keys [request]}]
+                       (let [hop #((:prepare-fn request) (assoc request :url %))]
+                         (support/then (support/all [(hop "https://social.example/users/ann/inbox")
+                                                     (hop "https://other.example/inbox")])
+                                       (fn [[same-origin other-origin]]
+                                         (is (= 1 (count (httpsig/signatures same-origin))))
+                                         (is (empty? (httpsig/signatures other-origin))
+                                             "a POST to another origin goes unsigned")
+                                         (is (nil? (get-in other-origin [:headers "Content-Digest"]))
+                                             "without the fields of the first signature"))))))))))

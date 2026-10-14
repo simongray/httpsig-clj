@@ -8,7 +8,8 @@
   promise of it). They throw ::httpsig/invalid-key for material that
   doesn't import, and ::httpsig/unsupported-algorithm for an algorithm that
   the library or the platform lacks."
-  (:require [dk.simongray.httpsig :as-alias httpsig]
+  (:require [clojure.string :as str]
+            [dk.simongray.httpsig :as-alias httpsig]
             [dk.simongray.httpsig.impl.async :as async]
             [dk.simongray.wary-fetch.async :as wary-async]
             [dk.simongray.wary-fetch.secret :as secret]
@@ -112,6 +113,23 @@
   [{:keys [kty] :as jwk}]
   (cond-> jwk
     (not= "oct" kty) (dissoc :d :p :q :dp :dq :qi :oth)))
+
+;; RFC 7518, section 6
+(def private-jwk-members
+  "The members of a JWK that hold a private key or a secret."
+  [:d :p :q :dp :dq :qi :oth :k])
+
+;; A result can reach a log, e.g. in a Ring request that a handler prints
+(defn shown
+  "The key map `key` without the material of a private key or a secret, as
+  the result of a verification shows it."
+  [{:keys [pem jwk] :as key}]
+  (cond-> (dissoc key :secret)
+    (some-> pem secret/reveal (str/includes? "PRIVATE KEY"))
+    (dissoc :pem)
+
+    jwk
+    (assoc :jwk (apply dissoc jwk (mapcat (juxt identity name) private-jwk-members)))))
 
 (defn secret-bytes
   "The bytes of the shared secret `s`: bytes, or text as UTF-8, hidden or

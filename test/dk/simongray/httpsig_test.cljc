@@ -2,6 +2,7 @@
   "The tests of HTTP Message Signatures, with the examples of RFC 9421."
   (:require #?(:clj  [clojure.test :refer [deftest is]]
                :cljs [cljs.test :refer-macros [deftest is]])
+            [clojure.string :as str]
             [dk.simongray.httpsig :as httpsig]
             [dk.simongray.httpsig.rfc9421-examples :as examples]
             [dk.simongray.httpsig.test-support :as support]))
@@ -236,3 +237,56 @@
   (is (= "sig1=(\"@method\" \"@target-uri\" \"@authority\" \"content-digest\" \"cache-control\");keyid=\"test-key-rsa-pss\";created;tag=\"app-123\""
          (httpsig/accept-signature {"sig1" {:components ["@method" "@target-uri" "@authority" "content-digest" "cache-control"]
                                             :params     {:keyid "test-key-rsa-pss" :created true :tag "app-123"}}}))))
+
+;; Fields from strangers: each of these took minutes with a regex that
+;; backtracked through the spaces, or with a field parsed again for each
+;; component that names it
+(deftest hostile-input
+  (let [spaces  (apply str (repeat 100000 " "))
+        members 2000]
+    (is (= (str "a" spaces "b") (httpsig/component {:headers {"X" (str " a" spaces "b\t")}} "x")))
+    (is (= "a b" (httpsig/component {:headers {"X" (str "a" spaces "\r\n" spaces "b")}} "x"))
+        "an obsolete line folding with spaces around it")
+    (support/run
+     #(support/then
+       (error-of {:method  :get
+                  :url     "https://example.com/"
+                  :headers {"X"               (str/join ", " (for [i (range members)] (str "m" i "=" i)))
+                            "Signature-Input" (str "sig1=(\"@method\" \"@target-uri\" "
+                                                   (str/join " " (for [i (range members)] (str "\"x\";key=\"m" i "\"")))
+                                                   ");created=1618884473;keyid=\"test-key-ecc-p256\"")
+                            "Signature"       "sig1=:AAAA:"}}
+                 {:now-fn (at 1618884473)})
+       (fn [e] (is (= ::httpsig/invalid-signature e) "a Dictionary named by each of its members"))))))
+
+;; A signature of the path alone would leave the query to anyone who
+;; changes it
+(deftest url-policy
+  (let [k       (get examples/jwk-keys "test-shared-secret")
+        request {:method :get :url "https://bank.example/transfer?to=alice&amount=1"}
+        check   (fn [components error]
+                  (support/then (httpsig/sign request k {:components components})
+                                (fn [signed]
+                                  (support/then (httpsig/verify signed (constantly k))
+                                                #(is (= error (:error %)) (pr-str components))))))]
+    (support/run
+     #(check ["@method" "@authority" "@path"] ::httpsig/not-covered)
+     #(check ["@method" "@authority" "@path" "@query"] nil)
+     #(check ["@method" "@authority" "@request-target"] nil)
+     #(check ["@method" "@target-uri"] nil))))
+
+(deftest results-show-no-private-keys
+  (let [request {:method :get :url "https://example.com/"}]
+    (support/run
+     #(support/all
+       (for [k [(get examples/jwk-keys "test-shared-secret")
+                (get examples/jwk-keys "test-key-ecc-p256")
+                (get examples/pem-keys "test-key-ecc-p256")]]
+         (support/then (httpsig/sign request k)
+                       (fn [signed]
+                         (support/then (httpsig/verify signed (constantly k))
+                                       (fn [{:keys [key]}]
+                                         (is (= (:keyid k) (:keyid key)))
+                                         (is (nil? (:secret key)))
+                                         (is (nil? (:pem key)))
+                                         (is (nil? (get-in key [:jwk :d]))))))))))))
